@@ -16,4 +16,4 @@ def build(bld):
     bld.program(source='main.c', target='abusir', use='mainobjects')
     #bld.stlib(source='a.c', target='mystlib')
     #bld.shlib(source='b.c', target='myshlib', use='mainobjects')
-    #bld.objects(source='blub.c', target='mainobjects')
+    bld.objects(source='hexdump.c sock.c', target='mainobjects')

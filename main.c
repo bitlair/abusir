@@ -1,128 +1,36 @@
 #define _GNU_SOURCE
-#include <sys/socket.h>
-#include <sys/types.h>
 #include <arpa/inet.h>
-#include <unistd.h>
-#include <linux/ipv6.h>
-#include <linux/if_ether.h>
 #include <netinet/in.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
-#include <sys/types.h>
 #include <errno.h>
 #include <stdio.h>
 
-/* netinet/icmp6.h does not */
+#include "hexdump.h"
+#include "sock.h"
+
+/* netinet/icmp6.h does not have these :'( */
 #ifndef ND_OPT_RDNSS
 #define ND_OPT_RDNSS 25
+struct nd_opt_rdnss {
+	uint8_t nd_opt_rdnss_type;
+	uint8_t nd_opt_rdnss_len;
+	uint16_t nd_opt_rdnss_reserved;
+	uint32_t nd_opt_rdnss_lifetime;
+};
 #endif
 
 #ifndef ND_OPT_DNSSL
 #define ND_OPT_DNSSL 31
+struct nd_opt_dnssl {
+	uint8_t nd_opt_dnssl_type;
+	uint8_t nd_opt_dnssl_len;
+	uint16_t nd_opt_dnssl_reserved;
+	uint32_t nd_opt_dnssl_lifetime;
+};
 #endif
 
 #define UNUSED(expr) (void)(expr)
-
-void hexdump (const char *desc, const void *addr, int len) {
-    int i;
-    unsigned char buff[17];
-    unsigned char *pc = (unsigned char*)addr;
-
-    // Output description if given.
-    if (desc != NULL)
-        printf ("%s:\n", desc);
-
-    if (len == 0) {
-        printf("  ZERO LENGTH\n");
-        return;
-    }
-    if (len < 0) {
-        printf("  NEGATIVE LENGTH: %i\n",len);
-        return;
-    }
-
-    for (i = 0; i < len; i++) {
-        if ((i % 16) == 0) {
-            if (i != 0)
-                printf ("  %s\n", buff);
-
-            printf ("  %04x ", i);
-        }
-
-        printf (" %02x", pc[i]);
-
-        if ((pc[i] < 0x20) || (pc[i] > 0x7e))
-            buff[i % 16] = '.';
-        else
-            buff[i % 16] = pc[i];
-        buff[(i % 16) + 1] = '\0';
-    }
-
-    // Pad out last line if not exactly 16 characters.
-    while ((i % 16) != 0) {
-        printf ("   ");
-        i++;
-    }
-
-    printf ("  %s\n", buff);
-}
-
-
-
-int open_icmpv6_socket(void)
-{
-    int sock;
-    struct icmp6_filter filter;
-    int err;
-
-    sock = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
-    if (sock < 0) {
-        fprintf(stderr, "can't create socket(AF_INET6): %s", strerror(errno));
-        return -1;
-    }
-
-    err = setsockopt(sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, (int[]){1}, sizeof(int));
-    if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_RECVPKTINFO): %s", strerror(errno));
-        return -1;
-    }
-
-    err = setsockopt(sock, IPPROTO_RAW, IPV6_CHECKSUM, (int[]){2}, sizeof(int));
-    if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_CHECKSUM): %s", strerror(errno));
-        return -1;
-    }
-
-    err = setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (int[]){255}, sizeof(int));
-    if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_UNICAST_HOPS): %s", strerror(errno));
-        return -1;
-    }
-
-    err = setsockopt(sock, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, (int[]){255}, sizeof(int));
-    if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_MULTICAST_HOPS): %s", strerror(errno));
-        return -1;
-    }
-    err = setsockopt(sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, (int[]){1}, sizeof(int));
-    if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_RECVHOPLIMIT): %s", strerror(errno));
-        return -1;
-    }
-
-    /* Select only the ICMPv6 types that we want */
-    ICMP6_FILTER_SETBLOCKALL(&filter);
-    ICMP6_FILTER_SETPASS(ND_ROUTER_SOLICIT, &filter);
-    ICMP6_FILTER_SETPASS(ND_ROUTER_ADVERT, &filter);
-
-    err = setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter));
-    if (err < 0) {
-        fprintf(stderr, "setsockopt(ICMPV6_FILTER): %s", strerror(errno));
-        return -1;
-    }
-
-    return sock;
-}
 
 void parse_router_solicitation(uint8_t *buf, size_t len) {
 	if (len < 8) {
@@ -205,12 +113,7 @@ void parse_router_advertisement(uint8_t *buf, size_t len) {
 				fprintf(stderr, "Incorrect length for RDNSS option\n");
 				break;
 			}
-			struct nd_opt_rdnss {
-				uint8_t nd_opt_rdnss_type;
-				uint8_t nd_opt_rdnss_len;
-				uint16_t nd_opt_rdnss_reserved;
-				uint32_t nd_opt_rdnss_lifetime;
-			} rdnss;
+			struct nd_opt_rdnss rdnss;
 			rdnss.nd_opt_rdnss_type = buf[nread];
 			rdnss.nd_opt_rdnss_len = buf[nread+1];
 			rdnss.nd_opt_rdnss_reserved = ntohs(*(uint16_t *)&buf[nread+2]);
@@ -228,12 +131,7 @@ void parse_router_advertisement(uint8_t *buf, size_t len) {
 			break;
 		}
 		case ND_OPT_DNSSL: {		/* TODO: Undo with lifetime 0 */
-			struct nd_opt_dnssl {
-				uint8_t nd_opt_dnssl_type;
-				uint8_t nd_opt_dnssl_len;
-				uint16_t nd_opt_dnssl_reserved;
-				uint32_t nd_opt_dnssl_lifetime;
-			} dnssl;
+			struct nd_opt_dnssl dnssl;
 			dnssl.nd_opt_dnssl_type = buf[nread];
 			dnssl.nd_opt_dnssl_len = buf[nread+1];
 			dnssl.nd_opt_dnssl_reserved = ntohs(*(uint16_t *)&buf[nread+2]);
@@ -291,7 +189,7 @@ int main (int argc, char *argv[]) {
 	char address[INET6_ADDRSTRLEN];
 	struct sockaddr_in6 addr;
 	struct in6_pktinfo *pkt_info;
-	unsigned char chdr[1024];
+	unsigned char chdr[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int))];
 	
 	memset(msg, 0, sizeof(msg));
 
@@ -318,6 +216,7 @@ int main (int argc, char *argv[]) {
 		int len = recvmsg(sock, &mhdr, 0);
 		printf("%d\n", len);
 		hexdump("mhdr", &mhdr, sizeof(mhdr));
+		hexdump("chdr", &chdr, sizeof(chdr));
 		inet_ntop(AF_INET6, &(addr.sin6_addr), address, INET6_ADDRSTRLEN);
 		printf("%s\n", address);
 
@@ -328,11 +227,11 @@ int main (int argc, char *argv[]) {
 			switch (cmsg->cmsg_type) {
 			case IPV6_PKTINFO:
 				if ((cmsg->cmsg_len == CMSG_LEN(sizeof(struct in6_pktinfo)))
-					&& ((struct in6_pktinfo *)CMSG_DATA(cmsg))->ipi6_ifindex) {
+						&& ((struct in6_pktinfo *)CMSG_DATA(cmsg))->ipi6_ifindex) {
 					pkt_info = (struct in6_pktinfo *)CMSG_DATA(cmsg);
 				} else {
 					fprintf(stderr, "received a bogus IPV6_PKTINFO from the kernel! len=%d, index=%d\n",
-						 (int)cmsg->cmsg_len, ((struct in6_pktinfo *)CMSG_DATA(cmsg))->ipi6_ifindex);
+							(int)cmsg->cmsg_len, ((struct in6_pktinfo *)CMSG_DATA(cmsg))->ipi6_ifindex);
 					return -1;
 				}
 				break;
