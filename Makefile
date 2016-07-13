@@ -1,8 +1,8 @@
 all:
-	./waf build
+	@./waf build
 
 clean:
-	./waf clean
+	@./waf clean
 
 configure:
-	./waf configure
+	@./waf configure

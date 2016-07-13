@@ -14,36 +14,36 @@ int open_icmpv6_socket(void) {
 
     sock = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
     if (sock < 0) {
-        fprintf(stderr, "can't create socket(AF_INET6): %s", strerror(errno));
+        fprintf(stderr, "Can't create socket(AF_INET6): %s\n", strerror(errno));
         return -1;
     }
 
     err = setsockopt(sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, (int[]){1}, sizeof(int));
     if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_RECVPKTINFO): %s", strerror(errno));
+        fprintf(stderr, "setsockopt(IPV6_RECVPKTINFO): %s\n", strerror(errno));
         return -1;
     }
 
     err = setsockopt(sock, IPPROTO_RAW, IPV6_CHECKSUM, (int[]){2}, sizeof(int));
     if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_CHECKSUM): %s", strerror(errno));
+        fprintf(stderr, "setsockopt(IPV6_CHECKSUM): %s\n", strerror(errno));
         return -1;
     }
 
     err = setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, (int[]){255}, sizeof(int));
     if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_UNICAST_HOPS): %s", strerror(errno));
+        fprintf(stderr, "setsockopt(IPV6_UNICAST_HOPS): %s\n", strerror(errno));
         return -1;
     }
 
     err = setsockopt(sock, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, (int[]){255}, sizeof(int));
     if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_MULTICAST_HOPS): %s", strerror(errno));
+        fprintf(stderr, "setsockopt(IPV6_MULTICAST_HOPS): %s\n", strerror(errno));
         return -1;
     }
     err = setsockopt(sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, (int[]){1}, sizeof(int));
     if (err < 0) {
-        fprintf(stderr, "setsockopt(IPV6_RECVHOPLIMIT): %s", strerror(errno));
+        fprintf(stderr, "setsockopt(IPV6_RECVHOPLIMIT): %s\n", strerror(errno));
         return -1;
     }
 
