@@ -8,6 +8,7 @@ clean:
 distclean:
 	@./waf distclean
 	@rm -rf cov-int
+	@rm -f coverity_abusir.tgz
 
 configure:
 	@./waf configure
