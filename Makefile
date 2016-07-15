@@ -7,12 +7,13 @@ clean:
 
 distclean:
 	@./waf distclean
+	@rm -rf cov-int
 
 configure:
 	@./waf configure
 
 splint:
-	@for i in *.c;do splint $$i;done
+	@for i in *.c;do splint $$i || true;done
 
 scanbuild:
 	@scan-build ./waf configure clean build
