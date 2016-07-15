@@ -6,6 +6,7 @@ def options(opt):
 
 def configure(conf):
     conf.load('compiler_c')
+#    conf.env.CFLAGS = ['-O0', '-std=c99', '-pedantic', '-g', '-ggdb', '-Wall']
     conf.env.CFLAGS = ['-O3', '-std=c99', '-pedantic', '-g', '-Wall', '-Wextra', '-Winit-self',
                        '-Wformat-security', '-Wshadow', '-Wpointer-arith', '-Wcast-align', '-Wwrite-strings',
                        '-Werror-implicit-function-declaration', '-Wstrict-prototypes',
@@ -32,4 +33,4 @@ def configure(conf):
 
 def build(bld):
     bld.program(source='main.c', target='abusir', use='mainobjects libconfig')
-    bld.objects(source='hexdump.c sock.c', target='mainobjects')
+    bld.objects(source='hexdump.c sock.c conf.c', target='mainobjects')
