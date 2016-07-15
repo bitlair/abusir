@@ -1,12 +1,29 @@
+/*
+
+	Copyright (C) 2015 by Wilco Baan Hofman <wilco@baanhofman.nl>
+
+	The hexdump function originated from
+    https://stackoverflow.com/questions/7775991/how-to-get-hexdump-of-a-structure-data
+	(Originally licensed WTFPL. Copyright (C) 2015 by paxdiablo).
+
+    This file is part of Abusir
+
+    Abusir is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    Abusir is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with Abusir.  If not, see <http://www.gnu.org/licenses/>.
+ */
 #include <stdio.h>
 #include <stdint.h>
 
-/*
- * I'm too lazy to write yet another hexdump function, so I took this 
- * function from stackoverflow:
- *
- * https://stackoverflow.com/questions/7775991/how-to-get-hexdump-of-a-structure-data
- */
 
 void hexdump (const char *desc, const void *addr, unsigned int len) {
     unsigned int i;
