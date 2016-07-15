@@ -80,6 +80,7 @@ int open_icmpv6_socket(void) {
 	err = setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, (socklen_t)sizeof(filter));
 	if (err < 0) {
 		fprintf(stderr, "setsockopt(ICMPV6_FILTER): %s", strerror(errno));
+		shutdown(sock, 2);
 		return -1;
 	}
 
