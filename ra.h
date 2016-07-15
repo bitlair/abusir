@@ -1,3 +1,8 @@
+#ifndef _RA_H
+#define _RA_H
+#include <netinet/icmp6.h>
+#include <netinet/if_ether.h>
+
 /* netinet/icmp6.h does not have these :'( */
 #ifndef ND_OPT_RDNSS
 #define ND_OPT_RDNSS 25
@@ -45,6 +50,15 @@ struct ra {
     struct nd_opt_prefix_info prefix_info[MAX_PREFIXES];
     struct in6_addr rdnss[MAX_RDNSS];
     char dnssl[MAX_DNSSL][HOST_NAME_MAX+1];
-    uint8_t source_lladdr[ETHER_ADDR_LEN];
+    uint8_t source_lladdr[ETH_ALEN];
 };
 
+#define PARSE_INT(x, y, size) { \
+	memcpy(&(x), (y), (size)); \
+	if ((size) == 2) { \
+		(x) = ntohs((x)); \
+	} else { \
+		(x) = ntohl((x)); \
+	}\
+}
+#endif
