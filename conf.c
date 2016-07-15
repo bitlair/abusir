@@ -98,6 +98,7 @@ static void read_dnssl(struct cf_interface *iface, config_setting_t *interface_s
 			break;
 		}
 		strncpy(iface->dnssl[i], string, HOST_NAME_MAX);
+		iface->dnssl[i][HOST_NAME_MAX-1] = '\0';
 		printf("%s\n", iface->dnssl[i]);
 	}
 }
@@ -198,7 +199,7 @@ void read_configuration(int signo) {
 			return;
 		}
 		printf("Parsing configuration for interface %s\n", config_setting_name(interface_settings));
-		strcpy(state.interfaces[i].ifname, config_setting_name(interface_settings));
+		strncpy(state.interfaces[i].ifname, config_setting_name(interface_settings), IF_NAMESIZE);
 		read_prefixes(&state.interfaces[i], interface_settings);
 		read_rdnss(&state.interfaces[i], interface_settings);
 		read_dnssl(&state.interfaces[i], interface_settings);
