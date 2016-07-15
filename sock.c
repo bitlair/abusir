@@ -36,7 +36,6 @@ int open_icmpv6_socket(void) {
 	sock = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
 	if (sock < 0) {
 		fprintf(stderr, "Can't create socket(AF_INET6): %s\n", strerror(errno));
-		close(sock);
 		return -1;
 	}
 
