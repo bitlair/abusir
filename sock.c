@@ -23,6 +23,7 @@
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <errno.h>
 
 
@@ -35,12 +36,14 @@ int open_icmpv6_socket(void) {
 	sock = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
 	if (sock < 0) {
 		fprintf(stderr, "Can't create socket(AF_INET6): %s\n", strerror(errno));
+		close(sock);
 		return -1;
 	}
 
 	err = setsockopt(sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, &val, (socklen_t)sizeof(int));
 	if (err < 0) {
 		fprintf(stderr, "setsockopt(IPV6_RECVPKTINFO): %s\n", strerror(errno));
+		close(sock);
 		return -1;
 	}
 
@@ -48,6 +51,7 @@ int open_icmpv6_socket(void) {
 	err = setsockopt(sock, IPPROTO_RAW, IPV6_CHECKSUM, &val, (socklen_t)sizeof(int));
 	if (err < 0) {
 		fprintf(stderr, "setsockopt(IPV6_CHECKSUM): %s\n", strerror(errno));
+		close(sock);
 		return -1;
 	}
 
@@ -56,12 +60,14 @@ int open_icmpv6_socket(void) {
 	err = setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &val, (socklen_t)sizeof(int));
 	if (err < 0) {
 		fprintf(stderr, "setsockopt(IPV6_UNICAST_HOPS): %s\n", strerror(errno));
+		close(sock);
 		return -1;
 	}
 
 	err = setsockopt(sock, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &val, (socklen_t)sizeof(int));
 	if (err < 0) {
 		fprintf(stderr, "setsockopt(IPV6_MULTICAST_HOPS): %s\n", strerror(errno));
+		close(sock);
 		return -1;
 	}
 
@@ -69,6 +75,7 @@ int open_icmpv6_socket(void) {
 	err = setsockopt(sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &val, (socklen_t)sizeof(int));
 	if (err < 0) {
 		fprintf(stderr, "setsockopt(IPV6_RECVHOPLIMIT): %s\n", strerror(errno));
+		close(sock);
 		return -1;
 	}
 
@@ -80,7 +87,7 @@ int open_icmpv6_socket(void) {
 	err = setsockopt(sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, (socklen_t)sizeof(filter));
 	if (err < 0) {
 		fprintf(stderr, "setsockopt(ICMPV6_FILTER): %s", strerror(errno));
-		shutdown(sock, 2);
+		close(sock);
 		return -1;
 	}
 
