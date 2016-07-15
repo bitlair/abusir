@@ -1,5 +1,5 @@
 /*
-	Copyright (C) 2016 by Wilco Baan Hofman <wilco@baanhofman.nl>
+    Copyright (C) 2016 by Wilco Baan Hofman <wilco@baanhofman.nl>
 
     This file is part of Abusir
 
@@ -28,148 +28,53 @@
 #include <netinet/icmp6.h>
 #include <netinet/if_ether.h>
 #include <net/if.h>
+#include <signal.h>
 #include <libconfig.h>
 #include <uthash.h>
+
 #include "hexdump.h"
+#include "conf.h"
 #include "sock.h"
 #include "ra.h"
 
 /* TODO:
- * - Move configuration to configuration subsystem
- * - Use configuration system to match bad configurations
  * - Actually send out countermeasures
  * - Add getopt
- * - Add License information
- * - Handle SIGHUP for reloading the configuration
  */
-#define UNUSED(expr) (void)(expr)
 
-config_t config, *cf = &config;
-
-struct cf_interface {
-	char interface[IF_NAMESIZE];
-	uint16_t prefix_count;
-	uint16_t rdnss_count;
-	uint16_t dnssl_count;
-	uint16_t allowed_mtu;
-	struct in6_addr prefix[16];
-	uint16_t prefix_len[16];
-	struct in6_addr rdnss[16];
-	char dnssl[16][HOST_NAME_MAX];
-};
-
-#define PARSE_INT(x, y, size) { \
-	memcpy(&x, y, size); \
-	if (size == 2) { \
-		x = ntohs(x); \
-	} else { \
-		x = ntohl(x); \
-	}\
-}
-
-/* Why did I need to make this myself again? */
-static int strtolong(const char *ptr, long minval, long maxval, long *value)
-{
-		errno = 0;
-		char *endptr;
-		*value = strtol(ptr, &endptr, 10);
-		if (errno) {
-			printf("Error converting string (%s) to int: %d: %s\n", ptr, errno, strerror(errno));
-			return errno;
-		}
-		if (ptr+strlen(ptr) != endptr) {
-			printf("Non-numeric characters in string: %s\n", ptr);
-			errno = EINVAL;
-			return EINVAL;
-		}
-		if (ptr == endptr) {
-			printf("No digits found in string: %s\n", ptr);
-			errno = EINVAL;
-			return EINVAL;
-		}
-		if (*value < minval || *value > maxval) {
-			printf("Invalid number specified: %s\n", ptr);
-			errno = ERANGE;
-			return ERANGE;
-		}
-		return 0;
-}
 
 static void handle_router_advertisement(const struct ra *ra, 
                                         const struct in6_addr *source_addr,
                                         const struct in6_pktinfo *pkt_info) {
 	UNUSED(source_addr);
-	config_setting_t *interfaces, *interface_settings, *prefixes;
-	char interface[IF_NAMESIZE];
+	char ifname[IF_NAMESIZE];
+	struct cf_interface *iface = NULL;
 
-	/* FIXME Configuration should be pre-parsed in memory */
-	interfaces = config_lookup(cf, "interfaces");
-	if (interfaces == NULL) {
-		fprintf(stderr, "No interfaces config.\n");
-		return;
-	}
-
-	char *rv_char = if_indextoname(pkt_info->ipi6_ifindex, interface);
+	char *rv_char = if_indextoname(pkt_info->ipi6_ifindex, ifname);
 	if (rv_char == NULL) {
 		fprintf(stderr, "Error getting index name: %d: %s\n", errno, strerror(errno));
 		return;
 	}
 
-	interface_settings = config_setting_get_member(interfaces, interface);
-	if (interface_settings == NULL) {
-		fprintf(stderr, "No config for this interface.\n");
+	for (int i = 0; i < state.iface_count; i++) {
+		if (strcmp(ifname, state.interfaces[i].ifname) == 0) {
+			iface = &state.interfaces[i];
+			break;
+		}
+	}
+
+	if (iface == NULL) {
+		fprintf(stderr, "Interface not found in configuration. Not doing anything.\n");
 		return;
 	}
 
-	if (ra->prefix_count == 0) {
-		fprintf(stderr, "No prefix to match against.\n");
-		return;
-	}
-	prefixes = config_setting_get_member(interface_settings, "allowed_prefixes");
-	if (prefixes == NULL) {
-		fprintf(stderr, "No prefixes defined.\n");
-		return;
-	}
-	int count = config_setting_length(prefixes);
-	for (int i = 0; i < count; i++) {
-		const char *string = config_setting_get_string_elem(prefixes, i);
-		if (string == NULL) {
-			printf("Error getting setting: %d: %s\n", errno, strerror(errno));
-			break;
-		}
-		char tmp[strlen(string)+1];
-		memcpy(tmp, string, strlen(string)+1);
-		char *ptr = tmp;
-		while (*ptr != '\0') {
-			if (*ptr == '/') {
-				*ptr = '\0';
-				ptr++;
-				break;
-			}
-			ptr++;
-		}
-		struct in6_addr prefix;
-		int rv = inet_pton(AF_INET6, tmp, &prefix);
-		if (!rv) {
-			printf("Error converting prefix (%s) to IPv6 address: %d: %s\n", string, errno, strerror(errno));
-			break;
-		}
-		hexdump("prefix", &prefix, sizeof(struct in6_addr));
-
-		long prefixlen;
-		rv = strtolong(ptr, 1, 127, &prefixlen);
-		if (rv) {
-			fprintf(stderr, "Error parsing prefix %s: %d: %s\n", string, errno, strerror(errno));
-			break;
-		}
-		printf("%s/%ld\n", tmp, prefixlen);
-
-		/* Match this allowed prefix against the prefix we got in the router advertisement. */
+	for (int i = 0; i < ra->prefix_count; i++) {
+		/* Match this prefix against the allowed prefixes. */
 		bool prefix_good = false;
-		for (int j = 0; j < ra->prefix_count; j++) {
-			if (memcmp(&ra->prefix_info[j].nd_opt_pi_prefix, &prefix, sizeof(struct in6_addr)) == 0 &&
-					prefixlen == ra->prefix_info[j].nd_opt_pi_prefix_len) {
-				fprintf(stderr, "Found valid prefix, yay!\n");
+		for (int j = 0; j < iface->prefix_count; j++) { 
+			if (memcmp(&ra->prefix_info[i].nd_opt_pi_prefix, &iface->prefix[j], sizeof(struct in6_addr)) == 0 &&
+					iface->prefix_len[j] == ra->prefix_info[i].nd_opt_pi_prefix_len) {
+				fprintf(stderr, "Prefix is valid, yay!\n");
 				prefix_good = true;
 				break;
 			}
@@ -179,6 +84,41 @@ static void handle_router_advertisement(const struct ra *ra,
 			fprintf(stderr, "Found bad prefix. Need to kill it with fire!\n");
 		}
 	}
+	for (int i = 0; i < ra->rdnss_count; i++) {
+		/* Match this RDNSS against the allowed prefixes. */
+		bool rdnss_good = false;
+		for (int j = 0; j < iface->rdnss_count; j++) { 
+			if (memcmp(&ra->rdnss[i], &iface->rdnss[j], sizeof(struct in6_addr)) == 0) {
+				fprintf(stderr, "RDNSS is valid, yay!\n");
+				rdnss_good = true;
+				break;
+			}
+		}
+		if (!rdnss_good) {
+			/* TODO: Add to the countermeasure list */
+			fprintf(stderr, "Found bad RDNSS. Need to kill it with fire!\n");
+		}
+	}
+	for (int i = 0; i < ra->dnssl_count; i++) {
+		/* Match this RDNSS against the allowed prefixes. */
+		bool dnssl_good = false;
+		for (int j = 0; j < iface->dnssl_count; j++) { 
+			if (strncmp(ra->dnssl[i], iface->dnssl[j], IF_NAMESIZE) == 0) {
+				fprintf(stderr, "DNSSL is valid, yay!\n");
+				dnssl_good = true;
+				break;
+			}
+		}
+		if (!dnssl_good) {
+			/* TODO: Add to the countermeasure list */
+			fprintf(stderr, "Found bad DNSSL. Need to kill it with fire!\n");
+		}
+	}
+	if (ra->mtu != iface->allowed_mtu) {
+		/* TODO: Add to the countermeasure list */
+		fprintf(stderr, "Found bad MTU. Need to kill it with fire!\n");
+	}	
+	
 	/* TODO: Send countermeasure RA */
 	
 }
@@ -196,7 +136,7 @@ static void debug_router_advertisement(const struct ra *ra,
 	printf("Prefix count: %d\n", ra->prefix_count);
 	printf("RDNSS count: %d\n", ra->rdnss_count);
 	printf("DNSSL count: %d\n", ra->dnssl_count);
-	hexdump("Source Link address", &ra->source_lladdr, ETHER_ADDR_LEN);
+	hexdump("Source Link address", &ra->source_lladdr, ETH_ALEN);
 
 	inet_ntop(AF_INET6, source_addr, addr_str, INET6_ADDRSTRLEN);
 	printf("Source address: %s\n", addr_str);
@@ -265,7 +205,7 @@ static int parse_router_advertisement(struct ra *ra,
 		}
 		switch(buf[nread]) {
 		case ND_OPT_SOURCE_LINKADDR:		/* RFC4861, section 4.6.1 */
-			memcpy(&ra->source_lladdr, &buf[nread+2], ETHER_ADDR_LEN);
+			memcpy(&ra->source_lladdr, &buf[nread+2], ETH_ALEN);
 			break;
 		case ND_OPT_PREFIX_INFORMATION: {	/* RFC4861, section 4.6.2 */
 			if (buf[nread+1]*8 < 32) {
@@ -413,7 +353,6 @@ static inline void handle_packet(
 int main (int argc, char *argv[]) {
 	UNUSED(argc);
 	UNUSED(argv);
-	int rv;
 	uint8_t msg[MAX_MSGLEN]; 
 	struct sockaddr_in6 source_addr;
 	struct in6_pktinfo pkt_info = {0};
@@ -427,18 +366,12 @@ int main (int argc, char *argv[]) {
 	}
 
 	/* TODO: Add getopt for getting a non-default configuration file location */
-	config_init(cf);
-	rv = config_read_file(cf, "abusir.conf");
-	if (rv != CONFIG_TRUE) {
-		fprintf(stderr, "%s:%d - %s\n",
-				config_error_file(cf),
-				config_error_line(cf),
-				config_error_text(cf));
-        config_destroy(cf);
-		return EXIT_FAILURE;
-	}
+	read_configuration(0);
+	if (signal(SIGHUP, read_configuration) == SIG_ERR) {
+		fprintf(stderr, "An error occurred while setting a signal handler.\n");
+        return EXIT_FAILURE;
+    }
 	
-
 	for (;;) {
 
 		struct iovec iov;
