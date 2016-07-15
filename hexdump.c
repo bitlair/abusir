@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 
 /*
  * I'm too lazy to write yet another hexdump function, so I took this 
@@ -7,10 +8,10 @@
  * https://stackoverflow.com/questions/7775991/how-to-get-hexdump-of-a-structure-data
  */
 
-void hexdump (const char *desc, const void *addr, int len) {
-    int i;
-    unsigned char buff[17];
-    unsigned char *pc = (unsigned char*)addr;
+void hexdump (const char *desc, const void *addr, unsigned int len) {
+    unsigned int i;
+    char buff[17] = "";
+    uint8_t *pc = (uint8_t*)addr;
 
     // Output description if given.
     if (desc != NULL)
@@ -18,10 +19,6 @@ void hexdump (const char *desc, const void *addr, int len) {
 
     if (len == 0) {
         printf("  ZERO LENGTH\n");
-        return;
-    }
-    if (len < 0) {
-        printf("  NEGATIVE LENGTH: %i\n",len);
         return;
     }
 
@@ -33,12 +30,12 @@ void hexdump (const char *desc, const void *addr, int len) {
             printf ("  %04x ", i);
         }
 
-        printf (" %02x", pc[i]);
+        printf (" %02x", (unsigned int)pc[i]);
 
         if ((pc[i] < 0x20) || (pc[i] > 0x7e))
             buff[i % 16] = '.';
         else
-            buff[i % 16] = pc[i];
+            buff[i % 16] = (char)pc[i];
         buff[(i % 16) + 1] = '\0';
     }
 
