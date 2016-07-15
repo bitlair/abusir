@@ -7,7 +7,7 @@
 #include "ra.h"
 
 struct cf_interface {
-	char ifname[IF_NAMESIZE];
+	char ifname[IF_NAMESIZE+1];
 	uint16_t prefix_count;
 	uint16_t rdnss_count;
 	uint16_t dnssl_count;
@@ -15,7 +15,7 @@ struct cf_interface {
 	struct in6_addr prefix[16];
 	uint16_t prefix_len[16];
 	struct in6_addr rdnss[16];
-	char dnssl[16][HOST_NAME_MAX];
+	char dnssl[16][HOST_NAME_MAX+1];
 };
 
 /* Globals */
