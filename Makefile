@@ -25,3 +25,6 @@ coverity:
 	@cov-build --dir=cov-int ./waf configure clean build
 	@tar cvzf coverity_abusir.tgz cov-int
 	@rm -rf cov-int
+
+cppcheck:
+	@cppcheck --std=c11 *.[ch]
