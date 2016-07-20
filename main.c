@@ -41,9 +41,9 @@
 
 #define IP6_HDRLEN 40
 /* TODO:
- * - High priority: move arrays to the heap to not stack overflow when max size is 65535
- * - High priority: Boundary check when sending packets (IP_MAXPACKET)
- * - High priority: valgrind complains about unitialized packets when sending, investigate
+ * - DNSSL handling 
+ * - High priority: move arrays to the heap to not stack overflow when max size is moved to 65535
+ * - High priority: valgrind complains about unitialized bytes when sending, investigate
  * - Guard reachable time and retransmit time
  * - Guard managed and other configuration flags (necessary?)
  * - Add getopt
@@ -112,14 +112,14 @@ static void send_countermeasure_ra(
 	offset += 16;
 
 	uint8_t compare[ETH_ALEN] = {0};
-	if (memcmp(ra->source_lladdr, compare, ETH_ALEN) != 0) {
+	if (memcmp(ra->source_lladdr, compare, ETH_ALEN) != 0 && offset + 8 < IP_MAXPACKET) {
 		buf->uint8[offset] = ND_OPT_SOURCE_LINKADDR;
 		buf->uint8[offset+1] = 8/8; // Off by factor of 8
 		memcpy(&buf->uint8[offset+2], ra->source_lladdr, ETH_ALEN);
 		offset += 8;
 	}
 
-	if (ra_out->mtu) {
+	if (ra_out->mtu && offset + 8 < IP_MAXPACKET) {
 		buf->uint8[offset] = ND_OPT_MTU;
 		buf->uint8[offset+1] = 8/8; // Off by factor of 8
 		buf->uint16[(offset+2)/2] = 0; /* reserved */
@@ -127,7 +127,7 @@ static void send_countermeasure_ra(
 		offset += 8;
 	}
 
-	for (int i = 0; i < ra_out->prefix_count; i++) {
+	for (int i = 0; i < ra_out->prefix_count && offset + 32 < IP_MAXPACKET; i++) {
 		buf->uint8[offset] = ND_OPT_PREFIX_INFORMATION;
 		buf->uint8[offset+1] = 32/8; // Off by factor of 8
 		buf->uint8[offset+2] = ra_out->prefix_info[i].nd_opt_pi_prefix_len;
@@ -139,13 +139,13 @@ static void send_countermeasure_ra(
 		offset += 32;
 	}
 
-	if (ra_out->rdnss_count) {
+	if (ra_out->rdnss_count && offset + 8 < IP_MAXPACKET) {
 		buf->uint8[offset] = ND_OPT_RDNSS;
 		buf->uint8[offset+1] = (8 + ra_out->rdnss_count * sizeof(struct in6_addr)) /8; /* Off by factor 8 */
 		buf->uint16[(offset+2)/2] = 0; /* reserved */
 		buf->uint32[(offset+4)/4] = 0; /* lifetime 0 */
 		offset += 8;
-		for (int i = 0; i < ra_out->rdnss_count; i++) {
+		for (int i = 0; i < ra_out->rdnss_count && offset + sizeof(struct in6_addr) < IP_MAXPACKET; i++) {
 			memcpy(&buf->uint8[offset], &ra_out->rdnss[i], sizeof(struct in6_addr));
 			offset += sizeof(struct in6_addr);
 		}
