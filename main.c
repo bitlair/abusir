@@ -27,28 +27,187 @@
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <netinet/if_ether.h>
+#include <linux/if_packet.h>
 #include <net/if.h>
 #include <signal.h>
 #include <libconfig.h>
 #include <uthash.h>
+#include <unistd.h>
 
 #include "hexdump.h"
 #include "conf.h"
 #include "sock.h"
 #include "ra.h"
 
+#define IP6_HDRLEN 40
 /* TODO:
- * - Actually send out countermeasures
+ * - High priority: move arrays to the heap to not stack overflow when max size is 65535
+ * - High priority: Boundary check when sending packets (IP_MAXPACKET)
+ * - High priority: valgrind complains about unitialized packets when sending, investigate
+ * - Guard reachable time and retransmit time
+ * - Guard managed and other configuration flags (necessary?)
  * - Add getopt
  */
 
+uint16_t icmp6_checksum(
+                        const struct in6_addr *source_addr,
+                        const struct in6_addr *dest_addr,
+                        const uint8_t *payload,
+                        const size_t length) {
+	/* Construct a pseudoheader */
+	buf_t *buf = malloc(sizeof(buf_t));
+	memset(buf, 0, sizeof(buf_t));
 
-static void handle_router_advertisement(const struct ra *ra, 
+	memcpy(&buf->uint8[0], source_addr, sizeof(struct in6_addr));
+	memcpy(&buf->uint8[16], dest_addr, sizeof(struct in6_addr));
+	buf->uint32[32/4] = htonl(length);
+	buf->uint8[39] = IPPROTO_ICMPV6;
+	memcpy(&buf->uint8[IP6_HDRLEN], payload, length);
+
+	uint32_t total = 0;
+	uint16_t *ptr   = &buf->uint16[0];
+	int words = (length + IP6_HDRLEN + 1) / 2; // +1 & truncation on / handles any odd byte at end
+
+	/*
+	*   As we're using a 32 bit int to calculate 16 bit checksum
+	*   we can accumulate carries in top half of DWORD and fold them in later
+	*/
+	while (words--) total += *ptr++;
+
+	/*
+	*   Fold in any carries
+	*   - the addition may cause another carry so we loop
+	*/
+	while (total & 0xffff0000) total = (total >> 16) + (total & 0xffff);
+	free(buf);
+	return (uint16_t) ~total;
+}
+
+static void send_countermeasure_ra(
+                                   const struct ra *ra_out,
+                                   const struct ra *ra,
+                                   const struct in6_addr *source_addr,
+                                   const struct in6_pktinfo *pkt_info) {
+	buf_t *buf = malloc(sizeof(buf_t));
+	memset(buf, 0, sizeof(buf_t));
+	int offset = IP6_HDRLEN;
+
+
+	/* Fill the buffer with the router advertisement header */
+	buf->uint8[offset] = ND_ROUTER_ADVERT; /* type */
+	buf->uint8[offset+1] = 0; /* code */
+	buf->uint16[(offset+2)/2] = htons(0); /* checksum */
+	buf->uint8[offset+4] = 64; /* Current hop limit */
+
+	/* Do not send out managed/other flags. FIXME: Do lots of testing */
+	buf->uint8[offset+5] = 0; /* Flags reserved */
+
+
+	buf->uint16[(offset+6)/2] = htons(0); /* Router lifetime */
+
+	/* FIXME Make reachable time and retrans timer configurable */
+	buf->uint32[(offset+8)/4] = htonl(30000); /* Reachable time 30 seconds */
+	buf->uint32[(offset+12)/4] = htonl(1000); /* Retrans timer 1000ms */
+
+	offset += 16;
+
+	uint8_t compare[ETH_ALEN] = {0};
+	if (memcmp(ra->source_lladdr, compare, ETH_ALEN) != 0) {
+		buf->uint8[offset] = ND_OPT_SOURCE_LINKADDR;
+		buf->uint8[offset+1] = 8/8; // Off by factor of 8
+		memcpy(&buf->uint8[offset+2], ra->source_lladdr, ETH_ALEN);
+		offset += 8;
+	}
+
+	if (ra_out->mtu) {
+		buf->uint8[offset] = ND_OPT_MTU;
+		buf->uint8[offset+1] = 8/8; // Off by factor of 8
+		buf->uint16[(offset+2)/2] = 0; /* reserved */
+		buf->uint32[(offset+4)/4] = htonl(ra_out->mtu); /* MTU */
+		offset += 8;
+	}
+
+	for (int i = 0; i < ra_out->prefix_count; i++) {
+		buf->uint8[offset] = ND_OPT_PREFIX_INFORMATION;
+		buf->uint8[offset+1] = 32/8; // Off by factor of 8
+		buf->uint8[offset+2] = ra_out->prefix_info[i].nd_opt_pi_prefix_len;
+		buf->uint8[offset+3] = ra->prefix_info[i].nd_opt_pi_flags_reserved;
+		buf->uint32[(offset+4)/4] = 0; // Valid time 0
+		buf->uint32[(offset+8)/4] = 0; // Prefered time 0
+		buf->uint32[(offset+12)/4] = 0; // Reserved 0
+		memcpy(&buf->uint8[offset+16], &ra->prefix_info[i].nd_opt_pi_prefix, sizeof(struct in6_addr));
+		offset += 32;
+	}
+
+	if (ra_out->rdnss_count) {
+		buf->uint8[offset] = ND_OPT_RDNSS;
+		buf->uint8[offset+1] = (8 + ra_out->rdnss_count * sizeof(struct in6_addr)) /8; /* Off by factor 8 */
+		buf->uint16[(offset+2)/2] = 0; /* reserved */
+		buf->uint32[(offset+4)/4] = 0; /* lifetime 0 */
+		offset += 8;
+		for (int i = 0; i < ra_out->rdnss_count; i++) {
+			memcpy(&buf->uint8[offset], &ra_out->rdnss[i], sizeof(struct in6_addr));
+			offset += sizeof(struct in6_addr);
+		}
+	}
+	/* TODO counteract DNSSL */
+
+
+	/*
+	 * All this for sending a raw frame with spoofed source IP, need to construct all headers..
+	 */
+
+	/* Set the IPv6 header */
+
+	/* IPv6 version (4 bits), Traffic class (8 bits), Flow label (20 bits) */
+	buf->uint32[0] = htonl ((6 << 28) | (0 << 20) | 0);
+	buf->uint16[4/2] = htons(offset - IP6_HDRLEN); /* IP6 Payload length */
+	buf->uint8[6] = IPPROTO_ICMPV6; /* ip6 next header */
+	buf->uint8[7] = 255; /* maximum hops */
+	memcpy(&buf->uint8[8], source_addr, sizeof(struct in6_addr));
+	static const struct in6_addr dest_addr = {0xff,0x02,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0x01};
+	memcpy(&buf->uint8[24], &dest_addr, sizeof(struct in6_addr));
+	uint16_t checksum = icmp6_checksum(source_addr, &dest_addr, &buf->uint8[IP6_HDRLEN], offset-IP6_HDRLEN);
+	buf->uint16[(IP6_HDRLEN+2)/2] = checksum;
+
+	struct sockaddr_ll lladdr = {0};
+	lladdr.sll_ifindex = pkt_info->ipi6_ifindex;
+	lladdr.sll_family = AF_PACKET;
+	lladdr.sll_protocol = htons(ETH_P_IPV6);
+	lladdr.sll_addr[0] = 0x33;
+	lladdr.sll_addr[1] = 0x33;
+	lladdr.sll_addr[2] = 0x00;
+	lladdr.sll_addr[3] = 0x00;
+	lladdr.sll_addr[4] = 0x00;
+	lladdr.sll_addr[5] = 0x01;
+	lladdr.sll_halen = ETH_ALEN;
+
+	int sock;
+	if ((sock = socket (PF_PACKET, SOCK_DGRAM, htons (ETH_P_ALL))) < 0) {
+		fprintf(stderr, "socket() failed. %d: %s", errno, strerror(errno));
+		free(buf);
+		return;
+	}
+
+	// Send ethernet frame to socket.
+	ssize_t bytes_sent = sendto (sock, &buf->uint8, offset, 0, (struct sockaddr *) &lladdr, sizeof (lladdr));
+	if (bytes_sent <= 0) {
+		fprintf(stderr, "sendto() failed. %d: %s", errno, strerror(errno));
+		close(sock);
+		free(buf);
+		return;
+	}
+	close (sock);
+	free(buf);
+}
+
+static void handle_router_advertisement(
+                                        const struct ra *ra,
                                         const struct in6_addr *source_addr,
                                         const struct in6_pktinfo *pkt_info) {
-	UNUSED(source_addr);
 	char ifname[IF_NAMESIZE];
 	struct cf_interface *iface = NULL;
+	struct ra ra_out = {0};
 
 	char *rv_char = if_indextoname(pkt_info->ipi6_ifindex, ifname);
 	if (rv_char == NULL) {
@@ -71,7 +230,7 @@ static void handle_router_advertisement(const struct ra *ra,
 	for (int i = 0; i < ra->prefix_count; i++) {
 		/* Match this prefix against the allowed prefixes. */
 		bool prefix_good = false;
-		for (int j = 0; j < iface->prefix_count; j++) { 
+		for (int j = 0; j < iface->prefix_count; j++) {
 			if (memcmp(&ra->prefix_info[i].nd_opt_pi_prefix, &iface->prefix[j], sizeof(struct in6_addr)) == 0 &&
 					iface->prefix_len[j] == ra->prefix_info[i].nd_opt_pi_prefix_len) {
 				fprintf(stderr, "Prefix is valid, yay!\n");
@@ -79,51 +238,61 @@ static void handle_router_advertisement(const struct ra *ra,
 				break;
 			}
 		}
-		if (!prefix_good) {
-			/* TODO: Add to the countermeasure list */
+		if (!prefix_good && ra->prefix_info[i].nd_opt_pi_valid_time != 0) {
 			fprintf(stderr, "Found bad prefix. Need to kill it with fire!\n");
+			/* Bad prefixes are countermeasured by sending the specific prefix with lifetime 0 */
+			memcpy(&ra_out.prefix_info[ra_out.prefix_count], &ra->prefix_info[i], sizeof(struct nd_opt_prefix_info));
+			ra_out.prefix_count++;
 		}
 	}
 	for (int i = 0; i < ra->rdnss_count; i++) {
-		/* Match this RDNSS against the allowed prefixes. */
+		/* Match this RDNSS against the allowed RDNSS for this interface. */
 		bool rdnss_good = false;
-		for (int j = 0; j < iface->rdnss_count; j++) { 
+		for (int j = 0; j < iface->rdnss_count; j++) {
 			if (memcmp(&ra->rdnss[i], &iface->rdnss[j], sizeof(struct in6_addr)) == 0) {
 				fprintf(stderr, "RDNSS is valid, yay!\n");
 				rdnss_good = true;
 				break;
 			}
 		}
-		if (!rdnss_good) {
-			/* TODO: Add to the countermeasure list */
+		if (!rdnss_good && ra->rdnss_lifetime[i] != 0) {
 			fprintf(stderr, "Found bad RDNSS. Need to kill it with fire!\n");
+			/* RDNSS abuse is countermeasured by sending the specific prefix with lifetime 0 */
+			memcpy(&ra_out.rdnss[ra_out.rdnss_count], &ra->rdnss[i], sizeof(struct in6_addr));
+			ra_out.rdnss_count++;
 		}
 	}
 	for (int i = 0; i < ra->dnssl_count; i++) {
-		/* Match this RDNSS against the allowed prefixes. */
+		/* Match this DNSSL against the allowed DNSSL for this interface. */
 		bool dnssl_good = false;
-		for (int j = 0; j < iface->dnssl_count; j++) { 
+		for (int j = 0; j < iface->dnssl_count; j++) {
 			if (strncmp(ra->dnssl[i], iface->dnssl[j], IF_NAMESIZE) == 0) {
 				fprintf(stderr, "DNSSL is valid, yay!\n");
 				dnssl_good = true;
 				break;
 			}
 		}
-		if (!dnssl_good) {
-			/* TODO: Add to the countermeasure list */
+		if (!dnssl_good && ra->rdnss_lifetime[i] != 0) {
 			fprintf(stderr, "Found bad DNSSL. Need to kill it with fire!\n");
+			/* DNSSL is countermeasured by sending the specific prefix with lifetime 0 */
+			strncpy(ra_out.dnssl[ra_out.dnssl_count], ra->dnssl[i], HOST_NAME_MAX);
+			ra_out.dnssl[ra_out.dnssl_count][HOST_NAME_MAX] = '\0';
+			ra_out.dnssl_count++;
 		}
 	}
-	if (ra->mtu != iface->allowed_mtu) {
-		/* TODO: Add to the countermeasure list */
+	if (ra->mtu && ra->mtu != iface->allowed_mtu) {
 		fprintf(stderr, "Found bad MTU. Need to kill it with fire!\n");
-	}	
-	
-	/* TODO: Send countermeasure RA */
-	
+		/* MTU abuse is countermeasured by sending the correct MTU for the interface */
+		ra_out.mtu = iface->allowed_mtu;
+	}
+
+	if (ra_out.mtu != 0 || ra_out.prefix_count != 0 || ra_out.rdnss_count != 0 ||
+			ra_out.dnssl_count != 0) {
+		send_countermeasure_ra(&ra_out, ra, source_addr, pkt_info);
+	}
 }
 
-static void debug_router_advertisement(const struct ra *ra, 
+static void debug_router_advertisement(const struct ra *ra,
                                        const struct in6_addr *source_addr,
                                        const struct in6_pktinfo *pkt_info) {
 	char addr_str[INET6_ADDRSTRLEN];
@@ -177,9 +346,9 @@ static int parse_router_solicitation(const uint8_t *buf,
 	return 1;
 }
 
-static int parse_router_advertisement(struct ra *ra, 
-                                      const uint8_t *buf, 
-                                      const size_t len) { 
+static int parse_router_advertisement(struct ra *ra,
+                                      const uint8_t *buf,
+                                      const size_t len) {
 	if (len < 16) {
 		fprintf(stderr, "Packet too short for router advertisement.\n");
 		return 0;
@@ -194,8 +363,8 @@ static int parse_router_advertisement(struct ra *ra,
 	PARSE_INT(advert->nd_ra_router_lifetime, &buf[6], sizeof(uint16_t));
 	PARSE_INT(advert->nd_ra_reachable, &buf[8], sizeof(uint32_t));
 	PARSE_INT(advert->nd_ra_retransmit, &buf[12], sizeof(uint32_t));
-	
-	/* Read all options. 
+
+	/* Read all options.
 	 * Note that all option lengths are off by a factor of 8. We fix this in the structs.
 	 */
 	for (size_t nread = 16;nread < len; nread += buf[nread + 1] * 8) {
@@ -237,9 +406,9 @@ static int parse_router_advertisement(struct ra *ra,
 				ra->mtu = mtu.nd_opt_mtu_mtu;
 			} else {
 				/* Bad value, IPv6 min mtu -1. Why?: We got multiple MTUs and we
-                 * need to reset the MTU to a proper value anyway as we have no way 
+                 * need to reset the MTU to a proper value anyway as we have no way
                  * of knowing which one the client set (first one? last one?) */
-				ra->mtu = 1279; 
+				ra->mtu = 1279;
 			}
 			break;
 		}
@@ -258,9 +427,10 @@ static int parse_router_advertisement(struct ra *ra,
 			/* Read all RDNSS entries */
 			for (int i = 0; ra->rdnss_count < MAX_RDNSS && i < (rdnss.nd_opt_rdnss_len-8)/16; i++) {
 				memcpy(&ra->rdnss[ra->rdnss_count], &buf[nread+8+i*16], 16);
+				ra->rdnss_lifetime[ra->rdnss_count] = rdnss.nd_opt_rdnss_lifetime;
 				ra->rdnss_count++;
 			}
-			
+
 			break;
 		}
 		case ND_OPT_DNSSL: {				/* RFC6106, section 5.2 */
@@ -276,13 +446,13 @@ static int parse_router_advertisement(struct ra *ra,
 
 			/* Read all DNSSL entries */
 			uint32_t offset = 8;
-			while (ra->dnssl_count < MAX_DNSSL && 
-				   offset < dnssl.nd_opt_dnssl_len && 
+			while (ra->dnssl_count < MAX_DNSSL &&
+				   offset < dnssl.nd_opt_dnssl_len &&
 				   buf[nread + offset] != '\0') {
 				char *tmp = ra->dnssl[ra->dnssl_count];
 				int tmp_off = 0;
 
-				/* Read every sequence label, e.g. \x06bitlair\x02nl\x00 for "bitlair.nl". 
+				/* Read every sequence label, e.g. \x06bitlair\x02nl\x00 for "bitlair.nl".
 				 * See RFC1035, section 3.1 */
 				uint32_t label_offset = offset;
 				while (label_offset < dnssl.nd_opt_dnssl_len && tmp_off <= HOST_NAME_MAX) {
@@ -308,9 +478,10 @@ static int parse_router_advertisement(struct ra *ra,
 					tmp[tmp_off] = '.';
 					tmp_off++;
 				}
+				ra->dnssl_lifetime[ra->dnssl_count] = dnssl.nd_opt_dnssl_lifetime;
 				ra->dnssl_count++;
 			}
-	
+
 			break;
 		}
 		/* Unhandled stuff */
@@ -318,6 +489,8 @@ static int parse_router_advertisement(struct ra *ra,
 		case ND_OPT_REDIRECTED_HEADER:	/* Not allowed, not a problem either */
 		case ND_OPT_RTR_ADV_INTERVAL:	/* Mobile IPv6, irrelevant for security */
 		case ND_OPT_HOME_AGENT_INFO:	/* Mobile IPv6, FIXME unsure what to do here */
+			fprintf(stderr, "Unexpected option type %d received. Ignoring\n", buf[nread]);
+			break;
 		default:
 			fprintf(stderr, "Unknown option type %d\n", buf[nread]);
 		}
@@ -353,11 +526,9 @@ static inline void handle_packet(
 int main (int argc, char *argv[]) {
 	UNUSED(argc);
 	UNUSED(argv);
-	uint8_t msg[MAX_MSGLEN]; 
 	struct sockaddr_in6 source_addr;
 	struct in6_pktinfo pkt_info = {0};
 	unsigned char chdr[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int))];
-	memset(msg, 0, sizeof(msg));
 
 	int sock = open_icmpv6_socket();
 	if (sock < 0) {
@@ -371,24 +542,26 @@ int main (int argc, char *argv[]) {
 		fprintf(stderr, "An error occurred while setting a signal handler.\n");
         return EXIT_FAILURE;
     }
-	
+
+	buf_t *msg = malloc(sizeof(buf_t));
+	memset(msg, 0, sizeof(buf_t));
 	for (;;) {
 
 		struct iovec iov;
-		iov.iov_len = MAX_MSGLEN;
-		iov.iov_base = (void *) msg;
+		iov.iov_len = sizeof(buf_t);
+		iov.iov_base = msg->uint8;
 
 		struct msghdr mhdr;
 		memset(&mhdr, 0, sizeof(mhdr));
-		mhdr.msg_name = (void *) &source_addr;
+		mhdr.msg_name = &source_addr;
 		mhdr.msg_namelen = sizeof(source_addr);
 		mhdr.msg_iov = &iov;
 		mhdr.msg_iovlen = 1;
-		mhdr.msg_control = (void *)chdr;
+		mhdr.msg_control = chdr;
 		mhdr.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int));
 
 		int len = recvmsg(sock, &mhdr, 0);
-
+		printf("%d\n", len);
 		for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr); cmsg != NULL; cmsg = CMSG_NXTHDR(&mhdr, cmsg)) {
 			if (cmsg->cmsg_level != IPPROTO_IPV6) { /* Should never happen with our interface filters */
 				continue;
@@ -402,6 +575,7 @@ int main (int argc, char *argv[]) {
 				if (pkt_info.ipi6_ifindex == 0) {
 					fprintf(stderr, "Received a bogus IPV6_PKTINFO from the kernel! len=%d\n",
 							(int)cmsg->cmsg_len);
+					free(msg);
 					return EXIT_FAILURE;
 				}
 				break;
@@ -412,7 +586,8 @@ int main (int argc, char *argv[]) {
 			continue;
 		}
 		printf("Executing parse function.\n");
-		handle_packet((uint8_t *)msg, len, &source_addr.sin6_addr, &pkt_info);
+		handle_packet(msg->uint8, len, &source_addr.sin6_addr, &pkt_info);
 	}
+	free(msg);
 	return EXIT_SUCCESS;
 }

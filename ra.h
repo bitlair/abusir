@@ -2,6 +2,7 @@
 #define _RA_H
 #include <netinet/icmp6.h>
 #include <netinet/if_ether.h>
+#include <netinet/ip.h>
 
 /* netinet/icmp6.h does not have these :'( */
 #ifndef ND_OPT_RDNSS
@@ -24,17 +25,22 @@ struct nd_opt_dnssl {
 };
 #endif
 
-#define MAX_MSGLEN      (1500-40)
 #define HDR_LEN         sizeof(struct nd_router_advert)
+
+/* FIXME: Hack to not stack overflow due to max assignments
+   Need to move all arrays to the heap to fix this permanently */
+
+#undef IP_MAXPACKET
+#define IP_MAXPACKET 1500
 
 /* Define the theoretical limits that can fit in a packet 
  * The prefix option is fixed length: with 1500 MTU, only 45 will fit.
  * The RDNSS option is not fixed length, but contains 16-byte IPv6-addreses
  * The DNSSL option is not fixed length and the shortest DNSSL option is one length byte, a character and a NUL-byte.
  */
-#define MAX_PREFIXES    ((MAX_MSGLEN - HDR_LEN) / sizeof(struct nd_opt_prefix_info) + 1)
-#define MAX_RDNSS       ((MAX_MSGLEN - HDR_LEN - sizeof(struct nd_opt_rdnss)) / sizeof(struct in6_addr) + 1)
-#define MAX_DNSSL       ((MAX_MSGLEN - HDR_LEN - sizeof(struct nd_opt_dnssl)) / 3 + 1)
+#define MAX_PREFIXES    ((IP_MAXPACKET - HDR_LEN) / sizeof(struct nd_opt_prefix_info) + 1)
+#define MAX_RDNSS       ((IP_MAXPACKET - HDR_LEN - sizeof(struct nd_opt_rdnss)) / sizeof(struct in6_addr) + 1)
+#define MAX_DNSSL       ((IP_MAXPACKET - HDR_LEN - sizeof(struct nd_opt_dnssl)) / 3 + 1)
 
 /* RFC1035, section 2.3.5 and section 3.1 specifies a max length of 255.
  * It also specifies a max label length of 63, but we do not enforce this, 
@@ -49,7 +55,9 @@ struct ra {
     uint16_t mtu;
     struct nd_opt_prefix_info prefix_info[MAX_PREFIXES];
     struct in6_addr rdnss[MAX_RDNSS];
+	uint32_t rdnss_lifetime[MAX_RDNSS];
     char dnssl[MAX_DNSSL][HOST_NAME_MAX+1];
+	uint32_t dnssl_lifetime[MAX_DNSSL];
     uint8_t source_lladdr[ETH_ALEN];
 };
 
@@ -61,4 +69,11 @@ struct ra {
 		(x) = ntohl((x)); \
 	}\
 }
+
+typedef union {
+	uint8_t uint8[IP_MAXPACKET];
+	uint16_t uint16[IP_MAXPACKET/2];
+	uint32_t uint32[IP_MAXPACKET/4];
+} buf_t;
+
 #endif
