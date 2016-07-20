@@ -7,9 +7,9 @@ Protects the network from rogue Router Advertisements. Allows the NOC to respond
 - To prevent bad prefixes, it announces the prefix with a valid and preferred lifetime of 0.
 - To prevent bad recursive DNS servers, it announces them with valid lifetime of 0.
 - To prevent bad DNS search lists, it announces them with valid lifetime of 0.
+- To prevent DoS by setting a reachable timer lower than the retransmit timer
 
 Still to do:
-- Guard reachable time and retransmit timer
 - Guard other-config/managed flags (Need to test if this is necessary).
 
 
