@@ -33,22 +33,23 @@
 #include <libconfig.h>
 #include <uthash.h>
 #include <unistd.h>
+#include <ctype.h>
 
 #include "hexdump.h"
 #include "conf.h"
 #include "sock.h"
 #include "ra.h"
 
-#define IP6_HDRLEN 40
 /* TODO:
  * - High priority: move arrays to the heap to not stack overflow when max size is moved to 65535
  * - High priority: valgrind complains about unitialized bytes when sending, investigate
  * - Use syslog
  * - Daemonize
- * - Guard reachable time and retransmit time
+ * - Guard reachable time and retransmit time (configurable)
  * - Guard managed and other configuration flags (necessary?)
- * - Add getopt
  */
+
+#define IP6_HDRLEN 40
 
 uint16_t icmp6_checksum(
                         const struct in6_addr *source_addr,
@@ -158,7 +159,9 @@ static void send_countermeasure_ra(
 		buf->uint16[(offset+2)/2] = 0; /* reserved */
 		buf->uint32[(offset+4)/4] = 0; /* lifetime 0 */
 		offset += 8;
-		/* See RFC1035 section 3.1 */
+		/* See RFC1035 section 3.1 for information about this format:
+		   nuldelimited and terminated list of addresses, with label size prepended.
+		   bitlair.nl -> \x06bitlair\x02nl\x00 */
 		for (int i = 0; i < ra_out->dnssl_count && offset + strlen(ra_out->dnssl[i]) + 2 < IP_MAXPACKET; i++) {
 			int start_of_label = 0;
 			for (int j = 0; offset + j - start_of_label + 1 < IP_MAXPACKET; j++) {
@@ -563,23 +566,48 @@ static inline void handle_packet(
 		return;
 	}
 }
-
-
+void help(const char *name) {
+	fprintf(stderr, "Syntax: %s [-c conf_file]\n", name);
+}
 int main (int argc, char *argv[]) {
-	UNUSED(argc);
-	UNUSED(argv);
 	struct sockaddr_in6 source_addr;
 	struct in6_pktinfo pkt_info = {0};
 	unsigned char chdr[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int))];
 
 	int sock = open_icmpv6_socket();
 	if (sock < 0) {
-		fprintf(stderr, "Sorry, no.\n");
-		return 1;
+		fprintf(stderr, "Sorry, can't open the socket (Are you root?).\n");
+		exit(EXIT_FAILURE);
 	}
 
-	/* TODO: Add getopt for getting a non-default configuration file location */
+	int c;
+	opterr = 0;
+	conf_file = "/etc/abusir.conf";
+	while ((c = getopt (argc, argv, "c:")) != -1) {
+		switch (c) {
+		case 'c':
+			conf_file = optarg;
+			break;
+		case '?':
+			if (optopt == 'c') {
+				fprintf(stderr, "Option -%c requires an argument.\n", optopt);
+			} else if (isprint (optopt)) {
+				fprintf(stderr, "Unknown option `-%c'.\n", optopt);
+			} else {
+				fprintf(stderr, "Unknown option character `\\x%x'.\n",
+					   optopt);
+			}
+			help(argv[0]);
+			exit(EXIT_FAILURE);
+		default:
+			help(argv[0]);
+			abort();
+		}
+	}
+
 	read_configuration(0);
+
+
 	if (signal(SIGHUP, read_configuration) == SIG_ERR) {
 		fprintf(stderr, "An error occurred while setting a signal handler.\n");
         return EXIT_FAILURE;

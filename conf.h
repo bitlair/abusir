@@ -31,5 +31,5 @@ struct {
 int strtolong(const char *ptr, long minval, long maxval, long *value);
 void read_configuration(int signo);
 
-
+extern const char *conf_file;
 #endif

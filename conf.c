@@ -28,8 +28,7 @@
 #include "conf.h"
 config_t config, *cf = &config;
 
-
-
+const char *conf_file;
 
 /* Why did I need to make this myself again? */
 int strtolong(const char *ptr, long minval, long maxval, long *value) {
@@ -163,9 +162,9 @@ void read_configuration(int signo) {
 	config_init(cf);
 
 	fprintf(stderr, "Reading configuration file\n");
-	int rv = config_read_file(cf, "abusir.conf");
+	int rv = config_read_file(cf, conf_file);
 	if (rv != CONFIG_TRUE) {
-		fprintf(stderr, "%s:%d - %s\n",
+		fprintf(stderr, "Error reading configuration file %s:%d - %s\n",
 				config_error_file(cf),
 				config_error_line(cf),
 				config_error_text(cf));
