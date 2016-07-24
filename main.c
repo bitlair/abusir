@@ -41,9 +41,10 @@
 
 #define IP6_HDRLEN 40
 /* TODO:
- * - DNSSL handling 
  * - High priority: move arrays to the heap to not stack overflow when max size is moved to 65535
  * - High priority: valgrind complains about unitialized bytes when sending, investigate
+ * - Use syslog
+ * - Daemonize
  * - Guard reachable time and retransmit time
  * - Guard managed and other configuration flags (necessary?)
  * - Add getopt
@@ -150,7 +151,48 @@ static void send_countermeasure_ra(
 			offset += sizeof(struct in6_addr);
 		}
 	}
-	/* TODO counteract DNSSL */
+	if (ra_out->dnssl_count && offset + 8 < IP_MAXPACKET) {
+		uint8_t *size = &buf->uint8[offset+1];
+		uint32_t start_offset = offset;
+		buf->uint8[offset] = ND_OPT_DNSSL;
+		buf->uint16[(offset+2)/2] = 0; /* reserved */
+		buf->uint32[(offset+4)/4] = 0; /* lifetime 0 */
+		offset += 8;
+		/* See RFC1035 section 3.1 */
+		for (int i = 0; i < ra_out->dnssl_count && offset + strlen(ra_out->dnssl[i]) + 2 < IP_MAXPACKET; i++) {
+			int start_of_label = 0;
+			for (int j = 0; offset + j - start_of_label + 1 < IP_MAXPACKET; j++) {
+				if (ra_out->dnssl[i][j] == '.' || ra_out->dnssl[i][j] == '\0') {
+					/* Write the size */
+					buf->uint8[offset] = j - start_of_label;
+					/* Write the label */
+					memcpy(&buf->uint8[offset + 1], &ra_out->dnssl[i][start_of_label], j - start_of_label);
+
+					offset += j - start_of_label + 1;
+					start_of_label = j+1;
+
+					if (ra_out->dnssl[i][j] == '\0') {
+						break;
+					}
+				}
+			}
+			if (offset < IP_MAXPACKET) {
+				buf->uint8[offset] = '\0';
+				offset++;
+			}
+		}
+		/* Pad to 8 bytes */
+		if ((offset - start_offset) % 8 != 0) {
+			offset += 8 - ((offset - start_offset) % 8);
+		}
+		*size = (offset - start_offset + 7) / 8 ; /* off by a factor 8 */
+
+		/* Prevent assigning more bytes than we can send out.. */
+		if (offset > IP_MAXPACKET) {
+			offset = IP_MAXPACKET;
+			fprintf(stderr, "Error: Tried sending more bytes than IP_MAXPACKET.\n");
+		}
+	}
 
 
 	/*
