@@ -9,7 +9,7 @@ def configure(conf):
 #    conf.env.CFLAGS = ['-O0', '-std=c99', '-pedantic', '-g', '-ggdb', '-Wall']
     conf.env.CFLAGS = ['-O3', '-std=c99', '-pedantic', '-g', '-Wall', '-Wextra', '-Winit-self',
                        '-Wformat-security', '-Wshadow', '-Wpointer-arith', '-Wcast-align', '-Wwrite-strings',
-                       '-Werror-implicit-function-declaration', '-Wstrict-prototypes',
+                       '-Werror-implicit-function-declaration', '-Wstrict-prototypes', '-Wunreachable-code',
                        '-fPIC', '-fstack-protector', '-D_FORTIFY_SOURCE=2', '-Wno-missing-field-initializers', '-Wno-missing-braces']
     conf.env.LDFLAGS = ['-fPIC', '-pie', '-z', 'relro', '-z', 'now', '-fstack-protector']
     conf.check(msg='Checking compiler flags', features='c cprogram')
