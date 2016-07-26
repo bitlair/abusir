@@ -34,8 +34,9 @@
 #include <uthash.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <syslog.h>
+#include <sys/file.h>
 
-#include "hexdump.h"
 #include "conf.h"
 #include "sock.h"
 #include "ra.h"
@@ -43,8 +44,7 @@
 /* TODO:
  * - High priority: move arrays to the heap to not stack overflow when max size is moved to 65535
  * - High priority: valgrind complains about unitialized bytes when sending, investigate
- * - Use syslog
- * - Daemonize
+ * - Better logging: source MAC, interface bad RA is detected on, which prefix/rdnss is announced
  * - Guard reachable time and retransmit time (configurable)
  * - Guard managed and other configuration flags (necessary?)
  */
@@ -56,10 +56,14 @@ uint16_t icmp6_checksum(
                         const struct in6_addr *dest_addr,
                         const uint8_t *payload,
                         const size_t length) {
-	/* Construct a pseudoheader */
 	buf_t *buf = malloc(sizeof(buf_t));
+	if (buf == NULL) {
+		syslog(LOG_ERR, "MEMORY ALLOCATION ERROR at %s:%d", __FILE__ , __LINE__);
+		exit(EXIT_FAILURE);
+	}
 	memset(buf, 0, sizeof(buf_t));
 
+	/* Construct a pseudoheader */
 	memcpy(&buf->uint8[0], source_addr, sizeof(struct in6_addr));
 	memcpy(&buf->uint8[16], dest_addr, sizeof(struct in6_addr));
 	buf->uint32[32/4] = htonl(length);
@@ -91,6 +95,10 @@ static void send_countermeasure_ra(
                                    const struct in6_addr *source_addr,
                                    const struct in6_pktinfo *pkt_info) {
 	buf_t *buf = malloc(sizeof(buf_t));
+	if (buf == NULL) {
+		syslog(LOG_ERR, "MEMORY ALLOCATION ERROR at %s:%d", __FILE__ , __LINE__);
+		exit(EXIT_FAILURE);
+	}
 	memset(buf, 0, sizeof(buf_t));
 	int offset = IP6_HDRLEN;
 
@@ -193,7 +201,7 @@ static void send_countermeasure_ra(
 		/* Prevent assigning more bytes than we can send out.. */
 		if (offset > IP_MAXPACKET) {
 			offset = IP_MAXPACKET;
-			fprintf(stderr, "Error: Tried sending more bytes than IP_MAXPACKET.\n");
+			syslog(LOG_ERR, "Error: Tried sending more bytes than IP_MAXPACKET.");
 		}
 	}
 
@@ -229,7 +237,7 @@ static void send_countermeasure_ra(
 
 	int sock;
 	if ((sock = socket (PF_PACKET, SOCK_DGRAM, htons (ETH_P_ALL))) < 0) {
-		fprintf(stderr, "socket() failed. %d: %s", errno, strerror(errno));
+		syslog(LOG_ERR, "socket() failed. %d: %s", errno, strerror(errno));
 		free(buf);
 		return;
 	}
@@ -237,7 +245,7 @@ static void send_countermeasure_ra(
 	// Send ethernet frame to socket.
 	ssize_t bytes_sent = sendto (sock, &buf->uint8, offset, 0, (struct sockaddr *) &lladdr, sizeof (lladdr));
 	if (bytes_sent <= 0) {
-		fprintf(stderr, "sendto() failed. %d: %s", errno, strerror(errno));
+		syslog(LOG_ERR, "sendto() failed. %d: %s", errno, strerror(errno));
 		close(sock);
 		free(buf);
 		return;
@@ -256,7 +264,7 @@ static void handle_router_advertisement(
 
 	char *rv_char = if_indextoname(pkt_info->ipi6_ifindex, ifname);
 	if (rv_char == NULL) {
-		fprintf(stderr, "Error getting index name: %d: %s\n", errno, strerror(errno));
+		syslog(LOG_ERR, "Error getting index name: %d: %s\n", errno, strerror(errno));
 		return;
 	}
 
@@ -268,7 +276,7 @@ static void handle_router_advertisement(
 	}
 
 	if (iface == NULL) {
-		fprintf(stderr, "Interface not found in configuration. Not doing anything.\n");
+		syslog(LOG_ERR, "Interface not found in configuration. Not doing anything.\n");
 		return;
 	}
 
@@ -278,13 +286,12 @@ static void handle_router_advertisement(
 		for (int j = 0; j < iface->prefix_count; j++) {
 			if (memcmp(&ra->prefix_info[i].nd_opt_pi_prefix, &iface->prefix[j], sizeof(struct in6_addr)) == 0 &&
 					iface->prefix_len[j] == ra->prefix_info[i].nd_opt_pi_prefix_len) {
-				fprintf(stderr, "Prefix is valid, yay!\n");
 				prefix_good = true;
 				break;
 			}
 		}
 		if (!prefix_good && ra->prefix_info[i].nd_opt_pi_valid_time != 0) {
-			fprintf(stderr, "Found bad prefix. Need to kill it with fire!\n");
+			syslog(LOG_ALERT, "Found advertised bad prefix. Taking countermeasures!\n");
 			/* Bad prefixes are countermeasured by sending the specific prefix with lifetime 0 */
 			memcpy(&ra_out.prefix_info[ra_out.prefix_count], &ra->prefix_info[i], sizeof(struct nd_opt_prefix_info));
 			ra_out.prefix_count++;
@@ -295,13 +302,12 @@ static void handle_router_advertisement(
 		bool rdnss_good = false;
 		for (int j = 0; j < iface->rdnss_count; j++) {
 			if (memcmp(&ra->rdnss[i], &iface->rdnss[j], sizeof(struct in6_addr)) == 0) {
-				fprintf(stderr, "RDNSS is valid, yay!\n");
 				rdnss_good = true;
 				break;
 			}
 		}
 		if (!rdnss_good && ra->rdnss_lifetime[i] != 0) {
-			fprintf(stderr, "Found bad RDNSS. Need to kill it with fire!\n");
+			syslog(LOG_ALERT, "Found advertised bad RDNSS. Taking countermeasures!\n");
 			/* RDNSS abuse is countermeasured by sending the specific prefix with lifetime 0 */
 			memcpy(&ra_out.rdnss[ra_out.rdnss_count], &ra->rdnss[i], sizeof(struct in6_addr));
 			ra_out.rdnss_count++;
@@ -312,13 +318,12 @@ static void handle_router_advertisement(
 		bool dnssl_good = false;
 		for (int j = 0; j < iface->dnssl_count; j++) {
 			if (strncmp(ra->dnssl[i], iface->dnssl[j], IF_NAMESIZE) == 0) {
-				fprintf(stderr, "DNSSL is valid, yay!\n");
 				dnssl_good = true;
 				break;
 			}
 		}
 		if (!dnssl_good && ra->rdnss_lifetime[i] != 0) {
-			fprintf(stderr, "Found bad DNSSL. Need to kill it with fire!\n");
+			syslog(LOG_ALERT, "Found advertised bad DNSSL %s. Taking countermeasures!\n", ra->dnssl[i]);
 			/* DNSSL is countermeasured by sending the specific prefix with lifetime 0 */
 			strncpy(ra_out.dnssl[ra_out.dnssl_count], ra->dnssl[i], HOST_NAME_MAX);
 			ra_out.dnssl[ra_out.dnssl_count][HOST_NAME_MAX] = '\0';
@@ -326,7 +331,7 @@ static void handle_router_advertisement(
 		}
 	}
 	if (ra->mtu && ra->mtu != iface->allowed_mtu) {
-		fprintf(stderr, "Found bad MTU. Need to kill it with fire!\n");
+		syslog(LOG_ALERT, "Found advertised bad MTU %d. Needs to be %d. Taking countermeasures!\n", ra->mtu, iface->allowed_mtu);
 		/* MTU abuse is countermeasured by sending the correct MTU for the interface */
 		ra_out.mtu = iface->allowed_mtu;
 	}
@@ -341,37 +346,35 @@ static void debug_router_advertisement(const struct ra *ra,
                                        const struct in6_addr *source_addr,
                                        const struct in6_pktinfo *pkt_info) {
 	char addr_str[INET6_ADDRSTRLEN];
-	printf("Got router advertisement from ");
 	inet_ntop(AF_INET6, source_addr, addr_str, INET6_ADDRSTRLEN);
-	printf("%s\n", addr_str);
+	syslog(LOG_DEBUG, "Got router advertisement from %s\n", addr_str);
 
-	printf("Router Lifetime: %d\n", ra->advert.nd_ra_router_lifetime);
-	printf("MTU: %d\n", ra->mtu);
-	printf("Prefix count: %d\n", ra->prefix_count);
-	printf("RDNSS count: %d\n", ra->rdnss_count);
-	printf("DNSSL count: %d\n", ra->dnssl_count);
-	hexdump("Source Link address", &ra->source_lladdr, ETH_ALEN);
+	syslog(LOG_DEBUG, "Router Lifetime: %d\n", ra->advert.nd_ra_router_lifetime);
+	syslog(LOG_DEBUG, "MTU: %d\n", ra->mtu);
+	syslog(LOG_DEBUG, "Prefix count: %d\n", ra->prefix_count);
+	syslog(LOG_DEBUG, "RDNSS count: %d\n", ra->rdnss_count);
+	syslog(LOG_DEBUG, "DNSSL count: %d\n", ra->dnssl_count);
 
 	inet_ntop(AF_INET6, source_addr, addr_str, INET6_ADDRSTRLEN);
-	printf("Source address: %s\n", addr_str);
+	syslog(LOG_DEBUG, "Source address: %s\n", addr_str);
 	inet_ntop(AF_INET6, &pkt_info->ipi6_addr, addr_str, INET6_ADDRSTRLEN);
-	printf("Destination address: %s\n", addr_str);
+	syslog(LOG_DEBUG, "Destination address: %s\n", addr_str);
 
 	char interface[IF_NAMESIZE];
-	printf("Interface index: %d: %s\n", pkt_info->ipi6_ifindex, if_indextoname(pkt_info->ipi6_ifindex, interface));
+	syslog(LOG_DEBUG, "Interface index: %d: %s\n", pkt_info->ipi6_ifindex, if_indextoname(pkt_info->ipi6_ifindex, interface));
 
 	for (int i = 0; i < ra->prefix_count; i++) {
 		char addr[INET6_ADDRSTRLEN];
 		inet_ntop(AF_INET6, &ra->prefix_info[i].nd_opt_pi_prefix, addr, INET6_ADDRSTRLEN);
-		printf("Prefix: %s/%d\n", addr, ra->prefix_info[i].nd_opt_pi_prefix_len);
+		syslog(LOG_DEBUG, "Prefix: %s/%d\n", addr, ra->prefix_info[i].nd_opt_pi_prefix_len);
 	}
 	for (int i = 0; i < ra->rdnss_count; i++) {
 		char addr[INET6_ADDRSTRLEN];
 		inet_ntop(AF_INET6, &ra->rdnss[i], addr, INET6_ADDRSTRLEN);
-		printf("Nameserver: %s\n", addr);
+		syslog(LOG_DEBUG, "Nameserver: %s\n", addr);
 	}
 	for (int i = 0; i < ra->dnssl_count; i++) {
-		printf("DNSSL: %s\n", ra->dnssl[i]);
+		syslog(LOG_DEBUG, "DNSSL: %s\n", ra->dnssl[i]);
 	}
 }
 
@@ -379,7 +382,7 @@ static void debug_router_advertisement(const struct ra *ra,
 static int parse_router_solicitation(const uint8_t *buf,
                                      const size_t len) {
 	if (len < 8) {
-		fprintf(stderr, "Packet too short for router solicitation.\n");
+		syslog(LOG_ERR, "Packet too short for router solicitation.\n");
 		return 0;
 	}
 	struct nd_router_solicit solicit;
@@ -387,7 +390,7 @@ static int parse_router_solicitation(const uint8_t *buf,
 	solicit.nd_rs_code = buf[1];
 	PARSE_INT(solicit.nd_rs_cksum, &buf[2], sizeof(uint16_t));
 	solicit.nd_rs_cksum = ntohs(solicit.nd_rs_cksum);
-	fprintf(stderr, "Got solicitation with checksum 0x%04X\n", solicit.nd_rs_cksum);
+	syslog(LOG_DEBUG, "Got solicitation with checksum 0x%04X\n", solicit.nd_rs_cksum);
 	return 1;
 }
 
@@ -395,7 +398,7 @@ static int parse_router_advertisement(struct ra *ra,
                                       const uint8_t *buf,
                                       const size_t len) {
 	if (len < 16) {
-		fprintf(stderr, "Packet too short for router advertisement.\n");
+		syslog(LOG_ERR, "Packet too short for router advertisement.\n");
 		return 0;
 	}
 
@@ -414,7 +417,7 @@ static int parse_router_advertisement(struct ra *ra,
 	 */
 	for (size_t nread = 16;nread < len; nread += buf[nread + 1] * 8) {
 		if (buf[nread + 1] == 0) {
-			fprintf(stderr, "Error: zero length in router advertisement option\n");
+			syslog(LOG_ERR, "Error: zero length in router advertisement option\n");
 			break;
 		}
 		switch(buf[nread]) {
@@ -423,7 +426,7 @@ static int parse_router_advertisement(struct ra *ra,
 			break;
 		case ND_OPT_PREFIX_INFORMATION: {	/* RFC4861, section 4.6.2 */
 			if (buf[nread+1]*8 < 32) {
-				fprintf(stderr, "Error: Incorrect length in prefix information RA option.\n");
+				syslog(LOG_ERR, "Error: Incorrect length in prefix information RA option.\n");
 				break;
 			}
 			struct nd_opt_prefix_info *prefix_info = &ra->prefix_info[ra->prefix_count];
@@ -459,7 +462,7 @@ static int parse_router_advertisement(struct ra *ra,
 		}
 		case ND_OPT_RDNSS: {				/* RFC6106, section 5.1 */
 			if (buf[nread+1]*8 < 2 || buf[nread+1] * 8 % 16 != 8) {
-				fprintf(stderr, "Incorrect length for RDNSS option\n");
+				syslog(LOG_ERR, "Incorrect length for RDNSS option\n");
 				break;
 			}
 			struct nd_opt_rdnss rdnss;
@@ -480,7 +483,7 @@ static int parse_router_advertisement(struct ra *ra,
 		}
 		case ND_OPT_DNSSL: {				/* RFC6106, section 5.2 */
 			if (buf[nread + 1] * 8 < 2 || nread + buf[nread+1] * 8 > len) {
-				fprintf(stderr, "Incorrect length for DNSSL option\n");
+				syslog(LOG_ERR, "Incorrect length for DNSSL option\n");
 				break;
 			}
 			struct nd_opt_dnssl dnssl;
@@ -504,7 +507,7 @@ static int parse_router_advertisement(struct ra *ra,
 					uint32_t length = buf[nread +  label_offset];
 
 					if (label_offset + length > dnssl.nd_opt_dnssl_len) {
-						fprintf(stderr, "Warning, want to read out of bounds!\n");
+						syslog(LOG_ERR, "Warning, want to read out of bounds!\n");
 						break;
 					}
 
@@ -534,10 +537,10 @@ static int parse_router_advertisement(struct ra *ra,
 		case ND_OPT_REDIRECTED_HEADER:	/* Not allowed, not a problem either */
 		case ND_OPT_RTR_ADV_INTERVAL:	/* Mobile IPv6, irrelevant for security */
 		case ND_OPT_HOME_AGENT_INFO:	/* Mobile IPv6, FIXME unsure what to do here */
-			fprintf(stderr, "Unexpected option type %d received. Ignoring\n", buf[nread]);
+			syslog(LOG_ERR, "Unexpected option type %d received. Ignoring\n", buf[nread]);
 			break;
 		default:
-			fprintf(stderr, "Unknown option type %d\n", buf[nread]);
+			syslog(LOG_ERR, "Unknown option type %d\n", buf[nread]);
 		}
 
 	}
@@ -562,39 +565,186 @@ static inline void handle_packet(
 		break;
     }
 	default:
-		fprintf(stderr, "Unknown message type: %d\n", buf[0]);	/* Should not be hit with our interface filters */
+		syslog(LOG_ERR, "Unknown message type: %d\n", buf[0]);	/* Should not be hit with our interface filters */
 		return;
 	}
 }
-void help(const char *name) {
-	fprintf(stderr, "Syntax: %s [-c conf_file]\n", name);
+
+
+static void child_handler(int signum) {
+    switch(signum) {
+    case SIGALRM:
+		exit(EXIT_FAILURE);
+		break;
+    case SIGUSR1:
+		exit(EXIT_SUCCESS);
+		break;
+    case SIGCHLD:
+		exit(EXIT_FAILURE);
+		break;
+    }
 }
+
+void daemonise(const char *pid_file) {
+	sighandler_t handler;
+	handler = signal(SIGCHLD, child_handler);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "Error setting signal handler CHLD: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	handler = signal(SIGUSR1, child_handler);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "Error setting signal handler USR1: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	handler = signal(SIGALRM, child_handler);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "Error setting signal handler ALRM: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	int pidfd = open(pid_file, O_WRONLY | O_CREAT, 0755);
+	if (pidfd < 0) {
+		syslog(LOG_ERR, "Unable to open pid file %s: %d: %s\n", pid_file, errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	int rv = flock(pidfd, LOCK_EX | LOCK_NB);
+	if (rv < 0) {
+		syslog(LOG_ERR, "Unable to lock pid file: %s: %d: %s\n", pid_file, errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		syslog(LOG_ERR, "Unable to fork(): %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	/* Parent */
+	if (pid > 0) {
+		close(pidfd);
+		alarm(2);
+		pause();
+		exit(EXIT_SUCCESS);
+	}
+
+	/* Child */
+	/* Lock the PID file exclusively */
+	flock(pidfd, LOCK_EX);
+
+	pid = getpid();
+	char pidbuf[12];
+	rv = snprintf(pidbuf, sizeof(pidbuf),  "%d\n", pid);
+	if (rv > (signed)sizeof(pidbuf) - 1) {
+		syslog(LOG_ERR, "Pid number larger than 11 digits");
+		exit(EXIT_FAILURE);
+	}
+	if (rv <= 0) {
+		syslog(LOG_ERR, "Unable to snprintf to pid buffer. %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+	ssize_t writerv = write(pidfd, pidbuf, strlen(pidbuf));
+	if (writerv < 0) {
+		syslog(LOG_ERR, "Error writing to pid file %s: %d: %s\n", pid_file, errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	/* Reset signals */
+    handler = signal(SIGCHLD,SIG_DFL);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "Error resetting signal handler CHLD: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+    handler = signal(SIGALRM,SIG_DFL);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "Error resetting signal handler ALRM: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	/* Ignore TTY signals */
+    handler = signal(SIGTSTP,SIG_IGN);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "Error setting signal handler TSTP: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+    handler = signal(SIGTTOU,SIG_IGN);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "Error setting signal handler TTOU: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+    handler = signal(SIGTTIN,SIG_IGN);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "Error setting signal handler TTIN: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+
+
+	pid_t sid = setsid();
+	if (sid < 0) {
+		syslog(LOG_ERR, "setsid failure %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	int chdir_rv = chdir("/");
+	if (chdir_rv < 0) {
+		syslog(LOG_ERR, "Can chdir to /: %d: %s\n", errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	FILE *fd;
+	fd = freopen( "/dev/null", "r", stdin);
+	if (fd == NULL) {
+		syslog(LOG_ERR, "Unable to close stdin: %d: %s\n", errno, strerror(errno));
+	}
+	fd = freopen( "/dev/null", "w", stdout);
+	if (fd == NULL) {
+		syslog(LOG_ERR, "Unable to close stdout: %d: %s\n", errno, strerror(errno));
+	}
+	fd = freopen( "/dev/null", "w", stderr);
+	if (fd == NULL) {
+		syslog(LOG_ERR, "Unable to close stderr: %d: %s\n", errno, strerror(errno));
+	}
+	pid_t parent = getppid();
+	kill(parent, SIGUSR1);
+}
+
+void help(const char *name) {
+	syslog(LOG_ERR, "Syntax: %s [-c conf_file] [-p pid_file]\n", name);
+}
+
 int main (int argc, char *argv[]) {
 	struct sockaddr_in6 source_addr;
 	struct in6_pktinfo pkt_info = {0};
 	unsigned char chdr[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int))];
+	const char *pid_file;
+	sighandler_t handler;
 
 	int sock = open_icmpv6_socket();
 	if (sock < 0) {
-		fprintf(stderr, "Sorry, can't open the socket (Are you root?).\n");
+		syslog(LOG_ERR, "Sorry, can't open the socket (Are you root?).\n");
 		exit(EXIT_FAILURE);
 	}
 
 	int c;
 	opterr = 0;
 	conf_file = "/etc/abusir.conf";
-	while ((c = getopt (argc, argv, "c:")) != -1) {
+	pid_file = "/var/run/abusir.pid";
+	while ((c = getopt (argc, argv, "c:p:")) != -1) {
 		switch (c) {
 		case 'c':
 			conf_file = optarg;
 			break;
+		case 'p':
+			pid_file = optarg;
+			break;
 		case '?':
-			if (optopt == 'c') {
-				fprintf(stderr, "Option -%c requires an argument.\n", optopt);
+			if (optopt == 'c' || optopt == 'p') {
+				syslog(LOG_ERR, "Option -%c requires an argument.\n", optopt);
 			} else if (isprint (optopt)) {
-				fprintf(stderr, "Unknown option `-%c'.\n", optopt);
+				syslog(LOG_ERR, "Unknown option `-%c'.\n", optopt);
 			} else {
-				fprintf(stderr, "Unknown option character `\\x%x'.\n",
+				syslog(LOG_ERR, "Unknown option character `\\x%x'.\n",
 					   optopt);
 			}
 			help(argv[0]);
@@ -607,13 +757,24 @@ int main (int argc, char *argv[]) {
 
 	read_configuration(0);
 
+	openlog(NULL, LOG_PID | LOG_NDELAY, LOG_DAEMON);
+	setlogmask(LOG_EMERG | LOG_ALERT | LOG_CRIT | LOG_ERR | LOG_WARNING | LOG_NOTICE | LOG_INFO);
 
-	if (signal(SIGHUP, read_configuration) == SIG_ERR) {
-		fprintf(stderr, "An error occurred while setting a signal handler.\n");
-        return EXIT_FAILURE;
+	daemonise(pid_file);
+
+	/* Configuration reload on SIGHUP handler */
+	handler = signal(SIGHUP, read_configuration);
+	if (handler == SIG_ERR) {
+		syslog(LOG_ERR, "An error occurred while setting a signal handler.\n");
+        exit(EXIT_FAILURE);
     }
 
+
 	buf_t *msg = malloc(sizeof(buf_t));
+	if (msg == NULL) {
+		syslog(LOG_ERR, "MEMORY ALLOCATION ERROR at %s:%d", __FILE__ , __LINE__);
+		exit(EXIT_FAILURE);
+	}
 	memset(msg, 0, sizeof(buf_t));
 	for (;;) {
 
@@ -631,7 +792,6 @@ int main (int argc, char *argv[]) {
 		mhdr.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int));
 
 		int len = recvmsg(sock, &mhdr, 0);
-		printf("%d\n", len);
 		for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr); cmsg != NULL; cmsg = CMSG_NXTHDR(&mhdr, cmsg)) {
 			if (cmsg->cmsg_level != IPPROTO_IPV6) { /* Should never happen with our interface filters */
 				continue;
@@ -643,21 +803,19 @@ int main (int argc, char *argv[]) {
 					memcpy(&pkt_info, CMSG_DATA(cmsg), sizeof(struct in6_pktinfo));;
 				}
 				if (pkt_info.ipi6_ifindex == 0) {
-					fprintf(stderr, "Received a bogus IPV6_PKTINFO from the kernel! len=%d\n",
+					syslog(LOG_ERR, "Received a bogus IPV6_PKTINFO from the kernel! len=%d\n",
 							(int)cmsg->cmsg_len);
 					free(msg);
-					return EXIT_FAILURE;
+					exit(EXIT_FAILURE);
 				}
 				break;
 			}
 		}
 		if (pkt_info.ipi6_ifindex == 0) {
-			fprintf(stderr, "Packet info structure is missing or invalid. No way to check which interface is used. Stopping");
+			syslog(LOG_ERR, "Packet info structure is missing or invalid. No way to check which interface is used. Stopping");
 			continue;
 		}
-		printf("Executing parse function.\n");
+		syslog(LOG_DEBUG, "Executing parse function.\n");
 		handle_packet(msg->uint8, len, &source_addr.sin6_addr, &pkt_info);
 	}
-	free(msg);
-	return EXIT_SUCCESS;
 }

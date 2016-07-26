@@ -23,8 +23,8 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/ip6.h>
+#include <syslog.h>
 
-#include "hexdump.h"
 #include "conf.h"
 config_t config, *cf = &config;
 
@@ -36,21 +36,21 @@ int strtolong(const char *ptr, long minval, long maxval, long *value) {
 		char *endptr;
 		*value = strtol(ptr, &endptr, 10);
 		if (errno) {
-			printf("Error converting string (%s) to int: %d: %s\n", ptr, errno, strerror(errno));
+			syslog(LOG_ERR, "Error converting string (%s) to int: %d: %s\n", ptr, errno, strerror(errno));
 			return errno;
 		}
 		if (ptr+strlen(ptr) != endptr) {
-			printf("Non-numeric characters in string: %s\n", ptr);
+			syslog(LOG_ERR, "Non-numeric characters in string: %s\n", ptr);
 			errno = EINVAL;
 			return errno;
 		}
 		if (ptr == endptr) {
-			printf("No digits found in string: %s\n", ptr);
+			syslog(LOG_ERR, "No digits found in string: %s\n", ptr);
 			errno = EINVAL;
 			return errno;
 		}
 		if (*value < minval || *value > maxval) {
-			printf("Invalid number specified: %s\n", ptr);
+			syslog(LOG_ERR, "Invalid number specified: %s\n", ptr);
 			errno = ERANGE;
 			return errno;
 		}
@@ -60,7 +60,7 @@ int strtolong(const char *ptr, long minval, long maxval, long *value) {
 static void read_rdnss(struct cf_interface *iface, config_setting_t *interface_settings) {
 	config_setting_t *rdnss = config_setting_get_member(interface_settings, "allowed_rdnss");
 	if (rdnss == NULL) {
-		printf("Not reading any allowed rdnss for %s\n", iface->ifname);
+		syslog(LOG_ERR, "Not reading any allowed rdnss for %s\n", iface->ifname);
 		return;
 	}
 		
@@ -68,24 +68,23 @@ static void read_rdnss(struct cf_interface *iface, config_setting_t *interface_s
 	for (int i = 0; i < iface->rdnss_count; i++) {
 		const char *string = config_setting_get_string_elem(rdnss, i);
 		if (string == NULL) {
-			printf("Error getting RDNSS at index %d: %d: %s\n", i, errno, strerror(errno));
+			syslog(LOG_ERR, "Error getting RDNSS at index %d: %d: %s\n", i, errno, strerror(errno));
 			break;
 		}
 		/* Convert the address string to an IPv6 address struct */
 		struct in6_addr addr;
 		int rv = inet_pton(AF_INET6, string, &addr);
 		if (!rv) {
-			printf("Error converting address (%s) to structure: %d: %s\n", string, errno, strerror(errno));
+			syslog(LOG_ERR, "Error converting address (%s) to structure: %d: %s\n", string, errno, strerror(errno));
 			break;
 		}
 		memcpy(&iface->rdnss[i], &addr, sizeof(struct in6_addr));
-		hexdump("addr", &addr, sizeof(struct in6_addr));
 	}
 }
 static void read_dnssl(struct cf_interface *iface, config_setting_t *interface_settings) {
 	config_setting_t *dnssl = config_setting_get_member(interface_settings, "allowed_dnssl");
 	if (dnssl == NULL) {
-		printf("Not reading any allowed dnssl for %s\n", iface->ifname);
+		syslog(LOG_ERR, "Not reading any allowed dnssl for %s\n", iface->ifname);
 		return;
 	}
 		
@@ -93,26 +92,26 @@ static void read_dnssl(struct cf_interface *iface, config_setting_t *interface_s
 	for (int i = 0; i < iface->dnssl_count; i++) {
 		const char *string = config_setting_get_string_elem(dnssl, i);
 		if (string == NULL) {
-			printf("Error getting DNSSL at index %d: %d: %s\n", i, errno, strerror(errno));
+			syslog(LOG_ERR, "Error getting DNSSL at index %d: %d: %s\n", i, errno, strerror(errno));
 			break;
 		}
 		strncpy(iface->dnssl[i], string, HOST_NAME_MAX);
 		iface->dnssl[i][HOST_NAME_MAX] = '\0';
-		printf("%s\n", iface->dnssl[i]);
+		syslog(LOG_DEBUG, "Allowed DNSSL: %s\n", iface->dnssl[i]);
 	}
 }
 
 static void read_prefixes(struct cf_interface *iface, config_setting_t *interface_settings) {
 	config_setting_t *prefixes = config_setting_get_member(interface_settings, "allowed_prefixes");
 	if (prefixes == NULL) {
-		printf("Not reading any allowed_prefixes for %s\n", iface->ifname);
+		syslog(LOG_ERR, "Not reading any allowed_prefixes for %s\n", iface->ifname);
 		return;
 	}
 	iface->prefix_count = config_setting_length(prefixes);
 	for (int i = 0; i < iface->prefix_count; i++) {
 		const char *string = config_setting_get_string_elem(prefixes, i);
 		if (string == NULL) {
-			printf("Error getting prefix: %d: %s\n", errno, strerror(errno));
+			syslog(LOG_ERR, "Error getting prefix: %d: %s\n", errno, strerror(errno));
 			break;
 		}
 		/* Split the prefix and length */
@@ -131,16 +130,15 @@ static void read_prefixes(struct cf_interface *iface, config_setting_t *interfac
 		struct in6_addr prefix;
 		int rv = inet_pton(AF_INET6, tmp, &prefix);
 		if (!rv) {
-			printf("Error converting prefix (%s) to IPv6 address: %d: %s\n", string, errno, strerror(errno));
+			syslog(LOG_ERR, "Error converting prefix (%s) to IPv6 address: %d: %s\n", string, errno, strerror(errno));
 			break;
 		}
-		hexdump("prefix", &prefix, sizeof(struct in6_addr));
 
 		/* Convert the prefix to an integer */
 		long prefix_len;
 		rv = strtolong(ptr, 1, 127, &prefix_len);
 		if (rv) {
-			fprintf(stderr, "Error parsing prefix %s: %d: %s\n", string, errno, strerror(errno));
+			syslog(LOG_ERR, "Error parsing prefix %s: %d: %s\n", string, errno, strerror(errno));
 			break;
 		}
 
@@ -161,10 +159,10 @@ void read_configuration(int signo) {
 	config_destroy(cf);
 	config_init(cf);
 
-	fprintf(stderr, "Reading configuration file\n");
+	syslog(LOG_DEBUG, "Reading configuration file\n");
 	int rv = config_read_file(cf, conf_file);
 	if (rv != CONFIG_TRUE) {
-		fprintf(stderr, "Error reading configuration file %s:%d - %s\n",
+		syslog(LOG_DEBUG, "Error reading configuration file %s:%d - %s\n",
 				config_error_file(cf),
 				config_error_line(cf),
 				config_error_text(cf));
@@ -174,30 +172,30 @@ void read_configuration(int signo) {
 	
 	interfaces = config_lookup(cf, "interfaces");
 	if (!interfaces) {
-		fprintf(stderr, "No interfaces config.\n");
+		syslog(LOG_DEBUG, "No interfaces config.\n");
 		return;
 	}
 	state.iface_count = config_setting_length(interfaces);
 	if (state.iface_count == 0) {
-		fprintf(stderr, "Error: No interfaces defined in the configuration file.\n");
+		syslog(LOG_DEBUG, "Error: No interfaces defined in the configuration file.\n");
 		return;
 	}
 	state.interfaces = realloc(state.interfaces, state.iface_count*sizeof(struct cf_interface));
 	if (!state.interfaces) {
-		fprintf(stderr, "MEMORY ALLOCATION ERROR\n");
+		syslog(LOG_DEBUG, "MEMORY ALLOCATION ERROR\n");
 		exit(EXIT_FAILURE);
 	}
 	memset(state.interfaces, 0, state.iface_count*sizeof(struct cf_interface));
 	for (int i = 0; i < state.iface_count; i++) {
 		config_setting_t *interface_settings = config_setting_get_elem(interfaces, i);
 		if (!interface_settings) {
-			fprintf(stderr, "%s:%d - %s\n",
+			syslog(LOG_DEBUG, "%s:%d - %s\n",
 					config_error_file(cf),
 					config_error_line(cf),
 					config_error_text(cf));
 			return;
 		}
-		printf("Parsing configuration for interface %s\n", config_setting_name(interface_settings));
+		syslog(LOG_DEBUG, "Parsing configuration for interface %s\n", config_setting_name(interface_settings));
 		strncpy(state.interfaces[i].ifname, config_setting_name(interface_settings), IF_NAMESIZE);
 		state.interfaces[i].ifname[IF_NAMESIZE] = '\0';
 		read_prefixes(&state.interfaces[i], interface_settings);
@@ -205,7 +203,7 @@ void read_configuration(int signo) {
 		read_dnssl(&state.interfaces[i], interface_settings);
 		rv = config_setting_lookup_int(interface_settings, "allowed_mtu", &state.interfaces[i].allowed_mtu);
 		if (rv != CONFIG_TRUE) {
-			fprintf(stderr, "Allowed MTU not found, guarding MTU 1500.\n");
+			syslog(LOG_DEBUG, "Allowed MTU not found, guarding MTU 1500.\n");
 			state.interfaces[i].allowed_mtu = 1500;
 			break;
 		}
