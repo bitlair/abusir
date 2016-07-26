@@ -45,6 +45,8 @@
  * - High priority: move arrays to the heap to not stack overflow when max size is moved to 65535
  * - High priority: valgrind complains about unitialized bytes when sending, investigate
  * - Better logging: source MAC, interface bad RA is detected on, which prefix/rdnss is announced
+ * - Add debug option for the syslog logmask.
+ * - Add getopt option to not daemonise for debugging purposes.
  * - Guard reachable time and retransmit time (configurable)
  * - Guard managed and other configuration flags (necessary?)
  */
