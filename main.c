@@ -43,7 +43,6 @@
 #include "ra.h"
 
 /* TODO:
- * - High priority: valgrind complains about unitialised bytes when sending, investigate
  * - Fragmentation handling + also sending when packet length exceeds interface MTU
  * - Thread for repeating invalidated prefixes and clean ups of fragments hash map 
  * - Guard reachable time and retransmit time (configurable)
@@ -114,7 +113,7 @@ static void send_countermeasure_ra(
 
 	buf->uint16[(offset+6)/2] = htons(0); /* Router lifetime */
 
-	/* FIXME Make reachable time and retrans timer configurable */
+	/* FIXME Make reachable time and retrans timer configurable per interface */
 	buf->uint32[(offset+8)/4] = htonl(30000); /* Reachable time 30 seconds */
 	buf->uint32[(offset+12)/4] = htonl(1000); /* Retrans timer 1000ms */
 
@@ -144,7 +143,7 @@ static void send_countermeasure_ra(
 		buf->uint32[(offset+4)/4] = 0; // Valid time 0
 		buf->uint32[(offset+8)/4] = 0; // Prefered time 0
 		buf->uint32[(offset+12)/4] = 0; // Reserved 0
-		memcpy(&buf->uint8[offset+16], &ra->prefix_info[i].nd_opt_pi_prefix, sizeof(struct in6_addr));
+		memcpy(&buf->uint8[offset+16], &ra_out->prefix_info[i].nd_opt_pi_prefix, sizeof(struct in6_addr));
 		offset += 32;
 	}
 
@@ -875,7 +874,6 @@ int main (int argc, char *argv[]) {
 		syslog(LOG_ERR, "An error occurred while setting a signal handler.\n");
         exit(EXIT_FAILURE);
     }
-
 
 	buf_t *msg = malloc(sizeof(buf_t));
 	if (msg == NULL) {
