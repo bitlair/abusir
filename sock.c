@@ -123,7 +123,7 @@ int open_icmpv6_socket(void) {
 		BPF_STMT(BPF_LD|BPF_IMM, true),                // ld #1
 		BPF_STMT(BPF_ST|BPF_K, 1),                     // st M[1] (set is_fragment to true)
 		BPF_STMT(BPF_LD|BPF_MEM, 0),                   // ld M[0]
-		BPF_STMT(BPF_JMP|BPF_JA, -35),                 // ja 4 (to jump table, hopefully)
+		BPF_STMT(BPF_JMP|BPF_JA, -35),                 // ja 4 (to jump table)
 
 		// ICMP Type selection (4 instructions)
 		BPF_STMT(BPF_LD|BPF_B|BPF_IND, 0),

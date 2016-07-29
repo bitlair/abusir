@@ -1,5 +1,7 @@
 #ifndef _RA_H
 #define _RA_H
+#include <linux/if_packet.h>
+#include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
@@ -27,12 +29,6 @@ struct nd_opt_dnssl {
 
 #define HDR_LEN         sizeof(struct nd_router_advert)
 
-/* FIXME: Hack to not stack overflow due to max assignments
-   Need to move all arrays to the heap to fix this permanently */
-
-#undef IP_MAXPACKET
-#define IP_MAXPACKET 1500
-
 /* Define the theoretical limits that can fit in a packet 
  * The prefix option is fixed length: with 1500 MTU, only 45 will fit.
  * The RDNSS option is not fixed length, but contains 16-byte IPv6-addreses
@@ -42,12 +38,17 @@ struct nd_opt_dnssl {
 #define MAX_RDNSS       ((IP_MAXPACKET - HDR_LEN - sizeof(struct nd_opt_rdnss)) / sizeof(struct in6_addr) + 1)
 #define MAX_DNSSL       ((IP_MAXPACKET - HDR_LEN - sizeof(struct nd_opt_dnssl)) / 3 + 1)
 
+// 3 characters per byte in ETH_ALEN: e.g. 01:23:45:54:32:10\0
+#define MAC_MAXSTR (3*ETH_ALEN)
+
 /* RFC1035, section 2.3.5 and section 3.1 specifies a max length of 255.
  * It also specifies a max label length of 63, but we do not enforce this, 
  * as anything advertised with longer labels should die too. */
 #define HOST_NAME_MAX 255
 
 struct ra {
+	struct sockaddr_ll lladdr;
+	struct in6_addr source_addr;
     struct nd_router_advert advert;
     uint16_t prefix_count;
     uint16_t rdnss_count;
@@ -63,7 +64,7 @@ struct ra {
 
 #define PARSE_INT(x, y, size) { \
 	memcpy(&(x), (y), (size)); \
-	if ((size) == 2) { \
+	if ((size) == sizeof(short)) { \
 		(x) = ntohs((x)); \
 	} else { \
 		(x) = ntohl((x)); \
@@ -72,8 +73,8 @@ struct ra {
 
 typedef union {
 	uint8_t uint8[IP_MAXPACKET];
-	uint16_t uint16[IP_MAXPACKET/2];
-	uint32_t uint32[IP_MAXPACKET/4];
+	uint16_t uint16[IP_MAXPACKET/sizeof(uint16_t)];
+	uint32_t uint32[IP_MAXPACKET/sizeof(uint32_t)];
 } buf_t;
 
 #endif

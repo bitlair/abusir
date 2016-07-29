@@ -37,16 +37,15 @@
 #include <syslog.h>
 #include <sys/file.h>
 
+#include "hexdump.h"
 #include "conf.h"
 #include "sock.h"
 #include "ra.h"
 
 /* TODO:
- * - High priority: move arrays to the heap to not stack overflow when max size is moved to 65535
- * - High priority: valgrind complains about unitialized bytes when sending, investigate
- * - Better logging: source MAC, interface bad RA is detected on, which prefix/rdnss is announced
- * - Add debug option for the syslog logmask.
- * - Add getopt option to not daemonise for debugging purposes.
+ * - High priority: valgrind complains about unitialised bytes when sending, investigate
+ * - Fragmentation handling + also sending when packet length exceeds interface MTU
+ * - Thread for repeating invalidated prefixes and clean ups of fragments hash map 
  * - Guard reachable time and retransmit time (configurable)
  * - Guard managed and other configuration flags (necessary?)
  */
@@ -93,9 +92,7 @@ uint16_t icmp6_checksum(
 
 static void send_countermeasure_ra(
                                    const struct ra *ra_out,
-                                   const struct ra *ra,
-                                   const struct in6_addr *source_addr,
-                                   const struct in6_pktinfo *pkt_info) {
+                                   const struct ra *ra) {
 	buf_t *buf = malloc(sizeof(buf_t));
 	if (buf == NULL) {
 		syslog(LOG_ERR, "MEMORY ALLOCATION ERROR at %s:%d", __FILE__ , __LINE__);
@@ -219,14 +216,14 @@ static void send_countermeasure_ra(
 	buf->uint16[4/2] = htons(offset - IP6_HDRLEN); /* IP6 Payload length */
 	buf->uint8[6] = IPPROTO_ICMPV6; /* ip6 next header */
 	buf->uint8[7] = 255; /* maximum hops */
-	memcpy(&buf->uint8[8], source_addr, sizeof(struct in6_addr));
+	memcpy(&buf->uint8[8], &ra->source_addr, sizeof(struct in6_addr));
 	static const struct in6_addr dest_addr = {0xff,0x02,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0x01};
 	memcpy(&buf->uint8[24], &dest_addr, sizeof(struct in6_addr));
-	uint16_t checksum = icmp6_checksum(source_addr, &dest_addr, &buf->uint8[IP6_HDRLEN], offset-IP6_HDRLEN);
+	uint16_t checksum = icmp6_checksum(&ra->source_addr, &dest_addr, &buf->uint8[IP6_HDRLEN], offset-IP6_HDRLEN);
 	buf->uint16[(IP6_HDRLEN+2)/2] = checksum;
 
 	struct sockaddr_ll lladdr = {0};
-	lladdr.sll_ifindex = pkt_info->ipi6_ifindex;
+	lladdr.sll_ifindex = ra->lladdr.sll_ifindex;
 	lladdr.sll_family = AF_PACKET;
 	lladdr.sll_protocol = htons(ETH_P_IPV6);
 	lladdr.sll_addr[0] = 0x33;
@@ -245,7 +242,7 @@ static void send_countermeasure_ra(
 	}
 
 	// Send ethernet frame to socket.
-	ssize_t bytes_sent = sendto (sock, &buf->uint8, offset, 0, (struct sockaddr *) &lladdr, sizeof (lladdr));
+	ssize_t bytes_sent = sendto(sock, &buf->uint8, offset, 0, (struct sockaddr *) &lladdr, sizeof (lladdr));
 	if (bytes_sent <= 0) {
 		syslog(LOG_ERR, "sendto() failed. %d: %s", errno, strerror(errno));
 		close(sock);
@@ -256,17 +253,20 @@ static void send_countermeasure_ra(
 	free(buf);
 }
 
-static void handle_router_advertisement(
-                                        const struct ra *ra,
-                                        const struct in6_addr *source_addr,
-                                        const struct in6_pktinfo *pkt_info) {
+static void handle_router_advertisement(const struct ra *ra) {
 	char ifname[IF_NAMESIZE];
 	struct cf_interface *iface = NULL;
-	struct ra ra_out = {0};
+	struct ra *ra_out = malloc(sizeof(struct ra));
+	if (!ra_out) {
+		syslog(LOG_ERR, "MEMORY ALLOCATION ERROR at %s:%d", __FILE__ , __LINE__);
+		exit(EXIT_FAILURE);
+	}
+	memset(ra_out, 0, sizeof(struct ra));
 
-	char *rv_char = if_indextoname(pkt_info->ipi6_ifindex, ifname);
+	char *rv_char = if_indextoname(ra->lladdr.sll_ifindex, ifname);
 	if (rv_char == NULL) {
 		syslog(LOG_ERR, "Error getting index name: %d: %s\n", errno, strerror(errno));
+		free(ra_out);
 		return;
 	}
 
@@ -279,8 +279,18 @@ static void handle_router_advertisement(
 
 	if (iface == NULL) {
 		syslog(LOG_ERR, "Interface not found in configuration. Not doing anything.\n");
+		free(ra_out);
 		return;
 	}
+
+	char macaddr[MAC_MAXSTR];
+	snprintf(macaddr, MAC_MAXSTR, "%02X:%02X:%02X:%02X:%02X:%02X",
+						  ra->lladdr.sll_addr[0],
+						  ra->lladdr.sll_addr[1],
+						  ra->lladdr.sll_addr[2],
+						  ra->lladdr.sll_addr[3],
+						  ra->lladdr.sll_addr[4],
+						  ra->lladdr.sll_addr[5]);
 
 	for (int i = 0; i < ra->prefix_count; i++) {
 		/* Match this prefix against the allowed prefixes. */
@@ -293,10 +303,14 @@ static void handle_router_advertisement(
 			}
 		}
 		if (!prefix_good && ra->prefix_info[i].nd_opt_pi_valid_time != 0) {
-			syslog(LOG_ALERT, "Found advertised bad prefix. Taking countermeasures!\n");
+			char addr[INET6_ADDRSTRLEN];
+			inet_ntop(AF_INET6, &ra->prefix_info[i].nd_opt_pi_prefix, addr, INET6_ADDRSTRLEN);
+			syslog(LOG_ALERT, "Found advertised bad prefix %s/%d from %s on %s. Taking countermeasures!\n", 
+			                  addr, ra->prefix_info[i].nd_opt_pi_prefix_len, macaddr, ifname);
+
 			/* Bad prefixes are countermeasured by sending the specific prefix with lifetime 0 */
-			memcpy(&ra_out.prefix_info[ra_out.prefix_count], &ra->prefix_info[i], sizeof(struct nd_opt_prefix_info));
-			ra_out.prefix_count++;
+			memcpy(&ra_out->prefix_info[ra_out->prefix_count], &ra->prefix_info[i], sizeof(struct nd_opt_prefix_info));
+			ra_out->prefix_count++;
 		}
 	}
 	for (int i = 0; i < ra->rdnss_count; i++) {
@@ -309,10 +323,14 @@ static void handle_router_advertisement(
 			}
 		}
 		if (!rdnss_good && ra->rdnss_lifetime[i] != 0) {
-			syslog(LOG_ALERT, "Found advertised bad RDNSS. Taking countermeasures!\n");
-			/* RDNSS abuse is countermeasured by sending the specific prefix with lifetime 0 */
-			memcpy(&ra_out.rdnss[ra_out.rdnss_count], &ra->rdnss[i], sizeof(struct in6_addr));
-			ra_out.rdnss_count++;
+			char addr[INET6_ADDRSTRLEN];
+			inet_ntop(AF_INET6, &ra->rdnss[i], addr, INET6_ADDRSTRLEN);
+			syslog(LOG_ALERT, "Found advertised bad RDNSS %s from %s on %s. Taking countermeasures!\n",
+			                  addr, macaddr, ifname);
+
+			/* RDNSS abuse is countermeasured by sending the RDNSS with lifetime 0 */
+			memcpy(&ra_out->rdnss[ra_out->rdnss_count], &ra->rdnss[i], sizeof(struct in6_addr));
+			ra_out->rdnss_count++;
 		}
 	}
 	for (int i = 0; i < ra->dnssl_count; i++) {
@@ -325,31 +343,37 @@ static void handle_router_advertisement(
 			}
 		}
 		if (!dnssl_good && ra->rdnss_lifetime[i] != 0) {
-			syslog(LOG_ALERT, "Found advertised bad DNSSL %s. Taking countermeasures!\n", ra->dnssl[i]);
-			/* DNSSL is countermeasured by sending the specific prefix with lifetime 0 */
-			strncpy(ra_out.dnssl[ra_out.dnssl_count], ra->dnssl[i], HOST_NAME_MAX);
-			ra_out.dnssl[ra_out.dnssl_count][HOST_NAME_MAX] = '\0';
-			ra_out.dnssl_count++;
+			syslog(LOG_ALERT, "Found advertised bad DNSSL %s from %s on %s. Taking countermeasures!\n",
+			                  ra->dnssl[i], macaddr, ifname);
+			/* DNSSL is countermeasured by sending the DNSSL with lifetime 0 */
+			strncpy(ra_out->dnssl[ra_out->dnssl_count], ra->dnssl[i], HOST_NAME_MAX);
+			ra_out->dnssl[ra_out->dnssl_count][HOST_NAME_MAX] = '\0';
+			ra_out->dnssl_count++;
 		}
 	}
 	if (ra->mtu && ra->mtu != iface->allowed_mtu) {
-		syslog(LOG_ALERT, "Found advertised bad MTU %d. Needs to be %d. Taking countermeasures!\n", ra->mtu, iface->allowed_mtu);
+		syslog(LOG_ALERT, "Found advertised bad MTU %d from %s on %s. Needs to be %d. Taking countermeasures!\n",
+		                  ra->mtu, macaddr, ifname, iface->allowed_mtu);
+
 		/* MTU abuse is countermeasured by sending the correct MTU for the interface */
-		ra_out.mtu = iface->allowed_mtu;
+		ra_out->mtu = iface->allowed_mtu;
 	}
 
-	if (ra_out.mtu != 0 || ra_out.prefix_count != 0 || ra_out.rdnss_count != 0 ||
-			ra_out.dnssl_count != 0) {
-		send_countermeasure_ra(&ra_out, ra, source_addr, pkt_info);
+	if (ra_out->mtu != 0 || ra_out->prefix_count != 0 || ra_out->rdnss_count != 0 ||
+			ra_out->dnssl_count != 0) {
+		send_countermeasure_ra(ra_out, ra);
 	}
+	free(ra_out);
 }
 
-static void debug_router_advertisement(const struct ra *ra,
-                                       const struct in6_addr *source_addr,
-                                       const struct in6_pktinfo *pkt_info) {
-	char addr_str[INET6_ADDRSTRLEN];
-	inet_ntop(AF_INET6, source_addr, addr_str, INET6_ADDRSTRLEN);
-	syslog(LOG_DEBUG, "Got router advertisement from %s\n", addr_str);
+static void debug_router_advertisement(const struct ra *ra) {
+	syslog(LOG_DEBUG, "Got router advertisement from %02X:%02X:%02X:%02X:%02X:%02X\n", 
+		ra->lladdr.sll_addr[0],
+		ra->lladdr.sll_addr[1],
+		ra->lladdr.sll_addr[2],
+		ra->lladdr.sll_addr[3],
+		ra->lladdr.sll_addr[4],
+		ra->lladdr.sll_addr[5]);
 
 	syslog(LOG_DEBUG, "Router Lifetime: %d\n", ra->advert.nd_ra_router_lifetime);
 	syslog(LOG_DEBUG, "MTU: %d\n", ra->mtu);
@@ -357,13 +381,12 @@ static void debug_router_advertisement(const struct ra *ra,
 	syslog(LOG_DEBUG, "RDNSS count: %d\n", ra->rdnss_count);
 	syslog(LOG_DEBUG, "DNSSL count: %d\n", ra->dnssl_count);
 
-	inet_ntop(AF_INET6, source_addr, addr_str, INET6_ADDRSTRLEN);
+	char addr_str[INET6_ADDRSTRLEN];
+	inet_ntop(AF_INET6, &ra->source_addr, addr_str, INET6_ADDRSTRLEN);
 	syslog(LOG_DEBUG, "Source address: %s\n", addr_str);
-	inet_ntop(AF_INET6, &pkt_info->ipi6_addr, addr_str, INET6_ADDRSTRLEN);
-	syslog(LOG_DEBUG, "Destination address: %s\n", addr_str);
 
 	char interface[IF_NAMESIZE];
-	syslog(LOG_DEBUG, "Interface index: %d: %s\n", pkt_info->ipi6_ifindex, if_indextoname(pkt_info->ipi6_ifindex, interface));
+	syslog(LOG_DEBUG, "Interface index: %d: %s\n", ra->lladdr.sll_ifindex, if_indextoname(ra->lladdr.sll_ifindex, interface));
 
 	for (int i = 0; i < ra->prefix_count; i++) {
 		char addr[INET6_ADDRSTRLEN];
@@ -380,29 +403,90 @@ static void debug_router_advertisement(const struct ra *ra,
 	}
 }
 
+static int parse_ipv6_headers(const uint8_t *buf, 
+                              const size_t len,
+                              struct in6_addr *source_addr,
+                              const uint8_t **payload_out,
+                              size_t *payload_len) {
+	size_t hdr_offset = sizeof(struct ip6_hdr);
+	uint8_t next_header = buf[offsetof(struct ip6_hdr, ip6_nxt)];
+	bool is_fragment = false;
+	bool more_fragments = false;
+	uint16_t fragment_offset = 0;
+	uint32_t fragment_ident;
 
-static int parse_router_solicitation(const uint8_t *buf,
-                                     const size_t len) {
-	if (len < 8) {
-		syslog(LOG_ERR, "Packet too short for router solicitation.\n");
-		return 0;
+	/* Handle all extension headers */
+	for (uint32_t i = 0; i < (IP_MAXPACKET - sizeof(struct ip6_hdr)) / 8; i++) {
+		switch (next_header) {
+		case IPPROTO_ICMPV6:
+			goto ICMPv6_or_frag_found; // break twice
+		case IPPROTO_FRAGMENT:
+			next_header = buf[hdr_offset];
+			PARSE_INT(fragment_offset, &buf[hdr_offset+2], sizeof(uint16_t));
+			more_fragments = fragment_offset & IP6F_MORE_FRAG >> 0;
+			fragment_offset = (fragment_offset & 0xFFF8) >> 3;
+			PARSE_INT(fragment_ident, &buf[hdr_offset+4], sizeof(uint32_t));
+			hdr_offset += 8;
+			is_fragment = true;
+			break;
+		case IPPROTO_AH:
+			next_header = buf[hdr_offset];
+			hdr_offset += buf[hdr_offset+1] + 2 * 4;
+			break;
+		case IPPROTO_ROUTING:
+		case IPPROTO_DSTOPTS:
+		case IPPROTO_HOPOPTS:
+		case IPPROTO_MH:
+			next_header = buf[hdr_offset];
+			hdr_offset += buf[hdr_offset+1] + 1 * 8;
+			break;
+		default:
+			if (is_fragment && fragment_offset != 0) {
+				goto ICMPv6_or_frag_found;
+			}
+			syslog(LOG_ERR, "Dropping packet with next header %d\n", next_header);
+			return 0;
+		}
 	}
-	struct nd_router_solicit solicit;
-	solicit.nd_rs_type = buf[0];
-	solicit.nd_rs_code = buf[1];
-	PARSE_INT(solicit.nd_rs_cksum, &buf[2], sizeof(uint16_t));
-	solicit.nd_rs_cksum = ntohs(solicit.nd_rs_cksum);
-	syslog(LOG_DEBUG, "Got solicitation with checksum 0x%04X\n", solicit.nd_rs_cksum);
+	ICMPv6_or_frag_found:
+
+
+	if (is_fragment) {
+		/* FIXME: If this is a fragment, we need to wait and find other fragments. */
+		// - If offset == 0 and ICMPv6 and more fragments: Add packet + fragmentation ident to hash map
+        // - else if offset != 0 and in hash map: append to packet in hash map
+		// - If no more fragments, continue
+        // - else: return
+		syslog(LOG_ERR, "Oh boy, fragmented packet... \n");
+		if (more_fragments) {
+			syslog(LOG_ERR, "More fragments are coming, ignoring the whole thing for now.");
+			return 0;
+		}
+	}
+	/* Get the source address from the packet */
+	memcpy(source_addr, &buf[offsetof(struct ip6_hdr, ip6_src)], sizeof(struct in6_addr));
+
+	/* Single packet payload */
+	*payload_out = &buf[hdr_offset];
+	*payload_len = len - hdr_offset;
 	return 1;
 }
 
 static int parse_router_advertisement(struct ra *ra,
                                       const uint8_t *buf,
-                                      const size_t len) {
+                                      const size_t len,
+                                      const struct sockaddr_ll *lladdr) {
 	if (len < 16) {
 		syslog(LOG_ERR, "Packet too short for router advertisement.\n");
 		return 0;
 	}
+	if (buf[0] != ND_ROUTER_ADVERT) {
+		syslog(LOG_DEBUG, "Got unexpected non-router advertisement.\n");
+		return 0;
+	}
+
+	/* Get the lladdr from sockaddr_ll */
+	memcpy(&ra->lladdr, lladdr, sizeof(struct sockaddr_ll));
 
 	struct nd_router_advert *advert = &ra->advert;
 	advert->nd_ra_type = buf[0];
@@ -546,30 +630,36 @@ static int parse_router_advertisement(struct ra *ra,
 		}
 
 	}
-	return 0;
+	return 1;
 }
 
 
 static inline void handle_packet(
-                         const uint8_t *buf,
-                         const size_t len,
-                         const struct in6_addr *source_addr,
-                         const struct in6_pktinfo *pkt_info) {
-	switch (buf[0]) {
-	case ND_ROUTER_SOLICIT:
-		parse_router_solicitation(buf, len);
-		break;
-	case ND_ROUTER_ADVERT: {
-		struct ra ra = {0};
-		parse_router_advertisement(&ra, buf, len);
-		debug_router_advertisement(&ra, source_addr, pkt_info);
-		handle_router_advertisement(&ra, source_addr, pkt_info);
-		break;
-    }
-	default:
-		syslog(LOG_ERR, "Unknown message type: %d\n", buf[0]);	/* Should not be hit with our interface filters */
+                                 const uint8_t *buf,
+                                 const size_t len,
+                                 const struct sockaddr_ll *lladdr) {
+	struct ra *ra = malloc(sizeof(struct ra));
+	if (ra == NULL) {
+		syslog(LOG_ERR, "MEMORY ALLOCATION ERROR at %s:%d", __FILE__ , __LINE__);
+		exit(EXIT_FAILURE);
+	}
+	memset(ra, 0, sizeof(struct ra));
+
+	const uint8_t *payload;
+	size_t payload_len;
+	int parsed_correctly = parse_ipv6_headers(buf, len, &ra->source_addr, &payload, &payload_len);
+	if (!parsed_correctly) {
+		free(ra);
 		return;
 	}
+	parsed_correctly = parse_router_advertisement(ra, payload, payload_len, lladdr);
+	if (!parsed_correctly) {
+		free(ra);
+		return;
+	}
+	debug_router_advertisement(ra);
+	handle_router_advertisement(ra);
+	free(ra);
 }
 
 
@@ -591,33 +681,39 @@ void daemonise(const char *pid_file) {
 	sighandler_t handler;
 	handler = signal(SIGCHLD, child_handler);
 	if (handler == SIG_ERR) {
+		fprintf(stderr, "Error setting signal handler CHLD: %d: %s\n", errno, strerror(errno));
 		syslog(LOG_ERR, "Error setting signal handler CHLD: %d: %s\n", errno, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 	handler = signal(SIGUSR1, child_handler);
 	if (handler == SIG_ERR) {
+		fprintf(stderr, "Error setting signal handler USR1: %d: %s\n", errno, strerror(errno));
 		syslog(LOG_ERR, "Error setting signal handler USR1: %d: %s\n", errno, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 	handler = signal(SIGALRM, child_handler);
 	if (handler == SIG_ERR) {
+		fprintf(stderr, "Error setting signal handler ALRM: %d: %s\n", errno, strerror(errno));
 		syslog(LOG_ERR, "Error setting signal handler ALRM: %d: %s\n", errno, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
 	int pidfd = open(pid_file, O_WRONLY | O_CREAT, 0755);
 	if (pidfd < 0) {
+		fprintf(stderr, "Unable to open pid file %s: %d: %s\n", pid_file, errno, strerror(errno));
 		syslog(LOG_ERR, "Unable to open pid file %s: %d: %s\n", pid_file, errno, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 	int rv = flock(pidfd, LOCK_EX | LOCK_NB);
 	if (rv < 0) {
+		fprintf(stderr, "Unable to lock pid file: %s: %d: %s\n", pid_file, errno, strerror(errno));
 		syslog(LOG_ERR, "Unable to lock pid file: %s: %d: %s\n", pid_file, errno, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
 	pid_t pid = fork();
 	if (pid < 0) {
+		fprintf(stderr, "Unable to fork(): %d: %s\n", errno, strerror(errno));
 		syslog(LOG_ERR, "Unable to fork(): %d: %s\n", errno, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
@@ -712,16 +808,14 @@ void daemonise(const char *pid_file) {
 }
 
 void help(const char *name) {
-	syslog(LOG_ERR, "Syntax: %s [-c conf_file] [-p pid_file]\n", name);
+	fprintf(stderr, "Syntax: %s [-d] [-c conf_file] [-p pid_file]\n", name);
 }
 
 int main (int argc, char *argv[]) {
-	struct sockaddr_in6 source_addr;
-	struct in6_pktinfo pkt_info = {0};
-	unsigned char chdr[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int))];
 	const char *pid_file;
 	sighandler_t handler;
-
+	bool debug = false;
+	bool foreground_mode = false;
 	int sock = open_icmpv6_socket();
 	if (sock < 0) {
 		syslog(LOG_ERR, "Sorry, can't open the socket (Are you root?).\n");
@@ -732,7 +826,7 @@ int main (int argc, char *argv[]) {
 	opterr = 0;
 	conf_file = "/etc/abusir.conf";
 	pid_file = "/var/run/abusir.pid";
-	while ((c = getopt (argc, argv, "c:p:")) != -1) {
+	while ((c = getopt (argc, argv, "c:p:dF")) != -1) {
 		switch (c) {
 		case 'c':
 			conf_file = optarg;
@@ -740,13 +834,19 @@ int main (int argc, char *argv[]) {
 		case 'p':
 			pid_file = optarg;
 			break;
+		case 'd':
+			debug = true;
+			break;
+		case 'F':
+			foreground_mode = true;
+			break;
 		case '?':
 			if (optopt == 'c' || optopt == 'p') {
-				syslog(LOG_ERR, "Option -%c requires an argument.\n", optopt);
+				fprintf(stderr, "Option -%c requires an argument.\n", optopt);
 			} else if (isprint (optopt)) {
-				syslog(LOG_ERR, "Unknown option `-%c'.\n", optopt);
+				fprintf(stderr, "Unknown option `-%c'.\n", optopt);
 			} else {
-				syslog(LOG_ERR, "Unknown option character `\\x%x'.\n",
+				fprintf(stderr, "Unknown option character `\\x%x'.\n",
 					   optopt);
 			}
 			help(argv[0]);
@@ -757,12 +857,17 @@ int main (int argc, char *argv[]) {
 		}
 	}
 
+	openlog(NULL, LOG_PID | LOG_NDELAY, LOG_DAEMON);
+	if (debug == true) {
+		setlogmask(LOG_UPTO(LOG_DEBUG));
+	} else {
+		setlogmask(LOG_UPTO(LOG_INFO));
+	}
 	read_configuration(0);
 
-	openlog(NULL, LOG_PID | LOG_NDELAY, LOG_DAEMON);
-	setlogmask(LOG_EMERG | LOG_ALERT | LOG_CRIT | LOG_ERR | LOG_WARNING | LOG_NOTICE | LOG_INFO);
-
-	daemonise(pid_file);
+	if (!foreground_mode) {
+		daemonise(pid_file);
+	}
 
 	/* Configuration reload on SIGHUP handler */
 	handler = signal(SIGHUP, read_configuration);
@@ -779,45 +884,19 @@ int main (int argc, char *argv[]) {
 	}
 	memset(msg, 0, sizeof(buf_t));
 	for (;;) {
-
-		struct iovec iov;
-		iov.iov_len = sizeof(buf_t);
-		iov.iov_base = msg->uint8;
-
-		struct msghdr mhdr;
-		memset(&mhdr, 0, sizeof(mhdr));
-		mhdr.msg_name = &source_addr;
-		mhdr.msg_namelen = sizeof(source_addr);
-		mhdr.msg_iov = &iov;
-		mhdr.msg_iovlen = 1;
-		mhdr.msg_control = chdr;
-		mhdr.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int));
-
-		int len = recvmsg(sock, &mhdr, 0);
-		for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr); cmsg != NULL; cmsg = CMSG_NXTHDR(&mhdr, cmsg)) {
-			if (cmsg->cmsg_level != IPPROTO_IPV6) { /* Should never happen with our interface filters */
-				continue;
-			}
-
-			switch (cmsg->cmsg_type) {
-			case IPV6_PKTINFO:
-				if (cmsg->cmsg_len == CMSG_LEN(sizeof(struct in6_pktinfo))) {
-					memcpy(&pkt_info, CMSG_DATA(cmsg), sizeof(struct in6_pktinfo));;
-				}
-				if (pkt_info.ipi6_ifindex == 0) {
-					syslog(LOG_ERR, "Received a bogus IPV6_PKTINFO from the kernel! len=%d\n",
-							(int)cmsg->cmsg_len);
-					free(msg);
-					exit(EXIT_FAILURE);
-				}
-				break;
-			}
-		}
-		if (pkt_info.ipi6_ifindex == 0) {
-			syslog(LOG_ERR, "Packet info structure is missing or invalid. No way to check which interface is used. Stopping");
+		/* Only way to guarantee this fits without casting all over the place */
+		union sockaddr_portable {
+			struct sockaddr_ll ll;
+			struct sockaddr_storage storage;
+		} lladdr = {0};
+		socklen_t socklen = sizeof(union sockaddr_portable);
+		int len = recvfrom(sock, msg, sizeof(buf_t), 0, (struct sockaddr *)&lladdr, &socklen);
+		syslog(LOG_DEBUG, "Got packet with ifindex %d\n", lladdr.ll.sll_ifindex);
+		if (lladdr.ll.sll_ifindex == 0) {
+			syslog(LOG_ERR, "No interface index received. No way to know where the packet came from.");
 			continue;
 		}
 		syslog(LOG_DEBUG, "Executing parse function.\n");
-		handle_packet(msg->uint8, len, &source_addr.sin6_addr, &pkt_info);
+		handle_packet(msg->uint8, len, &lladdr.ll);
 	}
 }
